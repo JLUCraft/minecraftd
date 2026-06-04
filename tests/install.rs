@@ -574,7 +574,7 @@ async fn test_forge_server_with_mod_end_to_end() {
 
     // Step 1: Install Forge server
     let forge = ForgeInstaller::new();
-    let forge_result = forge.install("1.20.1", "47.2.0", &game_dir).await;
+    let forge_result = forge.install("1.21.1", "52.1.14", &game_dir).await;
     if let Err(ref e) = forge_result {
         let msg = e.to_string().to_lowercase();
         if msg.contains("java") {
@@ -593,7 +593,7 @@ async fn test_forge_server_with_mod_end_to_end() {
 
     // Step 2: Install a real mod (JEI from Maven)
     let addon = AddonInstaller::new();
-    let mod_url = "https://maven.blamejared.com/mezz/jei/jei-1.20.1-forge/15.3.0.4/jei-1.20.1-forge-15.3.0.4.jar";
+    let mod_url = "https://maven.blamejared.com/mezz/jei/jei-1.21.1-forge/19.27.0.340/jei-1.21.1-forge-19.27.0.340.jar";
     let mod_result = addon
         .install_from_url(AddonType::Mod, mod_url, &game_dir, Some("jei.jar"))
         .await;
@@ -645,9 +645,10 @@ async fn test_forge_server_with_mod_end_to_end() {
         tokio::time::sleep(poll_interval).await;
         let binding = output.lock().unwrap();
         let current = String::from_utf8_lossy(&binding).to_string();
-        if current.contains("Forge")
-            || current.contains("MinecraftForge")
-            || current.contains("Done")
+        let lower = current.to_lowercase();
+        if lower.contains("forge")
+            || lower.contains("minecraftforge")
+            || lower.contains("done")
         {
             eprintln!("Forge server started in {:?}", started.elapsed());
             break current;
@@ -662,8 +663,11 @@ async fn test_forge_server_with_mod_end_to_end() {
         }
     };
 
+    let logs_lower = logs.to_lowercase();
     assert!(
-        logs.contains("Forge") || logs.contains("MinecraftForge") || logs.contains("Loading"),
+        logs_lower.contains("forge")
+            || logs_lower.contains("minecraftforge")
+            || logs_lower.contains("loading"),
         "server log should contain Forge startup messages, got: {}",
         &logs[..logs.len().min(500)]
     );

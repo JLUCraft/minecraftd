@@ -305,9 +305,12 @@ mod tests {
         };
 
         let result = validate_libraries(&version_info, &lib_dir).await;
-        // On non-Windows, this library should be skipped
-        #[cfg(not(target_os = "windows"))]
-        assert!(result.is_valid());
+        // Library is allowed only on Windows; on other platforms it's skipped.
+        if cfg!(target_os = "windows") {
+            assert_eq!(result.missing.len(), 1);
+        } else {
+            assert!(result.is_valid());
+        }
     }
 
     #[tokio::test]
