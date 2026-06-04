@@ -128,6 +128,7 @@ impl ModLoaderInstaller for NeoForgeInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::minecraft::loader::installer::run_installer_jar;
     use std::io::Write;
 
@@ -173,6 +174,7 @@ mod tests {
     }
 
     /// Tests the full install flow using a fake Java binary.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_neoforge_install_with_fake_java() {
         let tmpdir = tempfile::tempdir().unwrap();

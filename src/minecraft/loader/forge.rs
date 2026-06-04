@@ -108,6 +108,7 @@ impl ModLoaderInstaller for ForgeInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::minecraft::loader::installer::run_installer_jar;
     use std::io::Write;
 
@@ -191,6 +192,7 @@ mod tests {
 
     /// Tests the full install flow using a fake Java binary that simulates
     /// the Forge installer. The version.json is extracted from the fake jar.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_forge_install_with_fake_java() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -234,6 +236,7 @@ mod tests {
     }
 
     /// Tests that `run_installer_jar` correctly reports failure when Java exits non-zero.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_forge_installer_jar_failure() {
         let tmpdir = tempfile::tempdir().unwrap();

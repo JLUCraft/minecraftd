@@ -326,8 +326,11 @@ mod tests {
     async fn test_download_retry_exhausted_on_server_error() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
+            // Signal readiness before accepting to avoid race on slow CI runners
+            let _ = ready_tx.send(());
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -335,6 +338,9 @@ mod tests {
                 let _ = stream.shutdown().await;
             }
         });
+
+        // Wait for the server to be ready before sending requests
+        let _ = ready_rx.await;
 
         let task = DownloadTask::new(
             format!("http://127.0.0.1:{port}/file.jar"),

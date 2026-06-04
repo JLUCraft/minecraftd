@@ -398,6 +398,7 @@ mod tests {
         assert!(spec.args.contains(&"-Xmx2048m".to_string()));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_client_instance_start_stop() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -457,6 +458,7 @@ mod tests {
         assert!(matches!(result, Err(InstanceError::NotStoppable(_))));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_client_instance_start_when_already_running() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -481,6 +483,7 @@ mod tests {
         client.kill().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_client_instance_kill_while_running() {
         let tmpdir = tempfile::tempdir().unwrap();
