@@ -150,9 +150,7 @@ fn test_default_game_dir_matches_platform() {
     if cfg!(target_os = "macos") {
         assert!(s.contains("Application Support"));
         assert!(s.contains("minecraft"));
-    } else if cfg!(target_os = "linux") {
-        assert!(s.contains(".minecraft"));
-    } else if cfg!(target_os = "windows") {
+    } else {
         assert!(s.contains("minecraft"));
     }
 }

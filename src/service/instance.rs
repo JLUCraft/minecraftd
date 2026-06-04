@@ -179,7 +179,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     stop_command: "^C".into(),
                     ..Default::default()
                 }),
@@ -207,7 +207,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),
@@ -234,7 +234,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "cat".into(),
+                    start_command: "sh -c 'cat'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),
@@ -257,7 +257,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     stop_command: "^C".into(),
                     ..Default::default()
                 }),
@@ -283,7 +283,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 0.1".into(),
+                    start_command: "sh -c 'sleep 0.1'".into(),
                     ..Default::default()
                 }),
             RestartPolicy {
@@ -342,7 +342,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),
@@ -361,7 +361,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),
@@ -384,7 +384,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),
@@ -410,7 +410,7 @@ mod tests {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(ServerConfig {
-                    start_command: "sleep 10".into(),
+                    start_command: "sh -c 'sleep 10'".into(),
                     ..Default::default()
                 }),
             RestartPolicy::never(),

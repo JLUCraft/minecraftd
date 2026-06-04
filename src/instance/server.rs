@@ -112,6 +112,9 @@ where
         let command = parts[0].clone();
         let mut args = parts[1..].to_vec();
 
+        // Server daemon always runs headless — suppress the Minecraft GUI.
+        args.push("--nogui".to_string());
+
         // Apply JVM isolation properties
         if cfg.isolated_tmpdir {
             let tmpdir = self.core.path.subdir(InstanceSubdir::Tmp);
@@ -394,7 +397,7 @@ mod tests {
             .spawner(LocalSpawner::new())
             .event_bus(TokioBroadcastBus::new())
             .build_server(ServerConfig {
-                start_command: "sleep 0.5".into(),
+                start_command: "sh -c 'sleep 0.5'".into(),
                 stop_command: "^C".into(),
                 ..Default::default()
             });
@@ -490,7 +493,7 @@ mod tests {
             .spawner(LocalSpawner::new())
             .event_bus(TokioBroadcastBus::new())
             .build_server(ServerConfig {
-                start_command: "sleep 0.5".into(),
+                start_command: "sh -c 'sleep 0.5'".into(),
                 ..Default::default()
             });
 
@@ -507,7 +510,7 @@ mod tests {
             .spawner(LocalSpawner::new())
             .event_bus(TokioBroadcastBus::new())
             .build_server(ServerConfig {
-                start_command: "cat".into(),
+                start_command: "sh -c 'cat'".into(),
                 ..Default::default()
             });
 
@@ -523,7 +526,7 @@ mod tests {
             .spawner(LocalSpawner::new())
             .event_bus(TokioBroadcastBus::new())
             .build_server(ServerConfig {
-                start_command: "sleep 0.3".into(),
+                start_command: "sh -c 'sleep 0.3'".into(),
                 ..Default::default()
             });
 

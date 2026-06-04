@@ -14,7 +14,7 @@ async fn test_service_start_stop_server() {
         .spawner(LocalSpawner::new())
         .event_bus(TokioBroadcastBus::new())
         .build_server(ServerConfig {
-            start_command: "sleep 10".into(),
+            start_command: "sh -c 'sleep 10'".into(),
             stop_command: "^C".into(),
             ..Default::default()
         });
@@ -40,7 +40,7 @@ async fn test_service_state_watch() {
         .spawner(LocalSpawner::new())
         .event_bus(TokioBroadcastBus::new())
         .build_server(ServerConfig {
-            start_command: "sleep 10".into(),
+            start_command: "sh -c 'sleep 10'".into(),
             ..Default::default()
         });
     let service = InstanceService::new(server, RestartPolicy::never());
@@ -66,7 +66,7 @@ async fn test_service_auto_restart_crash() {
         .spawner(LocalSpawner::new())
         .event_bus(TokioBroadcastBus::new())
         .build_server(ServerConfig {
-            start_command: "sleep 0.05".into(), // exits quickly
+            start_command: "sh -c 'sleep 0.05'".into(), // exits quickly
             ..Default::default()
         });
     let restart_policy = RestartPolicy {
@@ -95,7 +95,7 @@ async fn test_service_operations_after_shutdown() {
         .spawner(LocalSpawner::new())
         .event_bus(TokioBroadcastBus::new())
         .build_server(ServerConfig {
-            start_command: "sleep 10".into(),
+            start_command: "sh -c 'sleep 10'".into(),
             stop_command: "^C".into(),
             ..Default::default()
         });
@@ -124,7 +124,7 @@ async fn test_service_restart_command() {
     .spawner(LocalSpawner::new())
     .event_bus(TokioBroadcastBus::new())
     .build_server(ServerConfig {
-        start_command: "sleep 10".into(),
+        start_command: "sh -c 'sleep 10'".into(),
         ..Default::default()
     });
     let service = InstanceService::new(server, RestartPolicy::never());
