@@ -646,10 +646,7 @@ async fn test_forge_server_with_mod_end_to_end() {
         let binding = output.lock().unwrap();
         let current = String::from_utf8_lossy(&binding).to_string();
         let lower = current.to_lowercase();
-        if lower.contains("forge")
-            || lower.contains("minecraftforge")
-            || lower.contains("done")
-        {
+        if lower.contains("forge") || lower.contains("minecraftforge") || lower.contains("done") {
             eprintln!("Forge server started in {:?}", started.elapsed());
             break current;
         }

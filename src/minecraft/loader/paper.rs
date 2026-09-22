@@ -2,8 +2,66 @@ use crate::download::task::DownloadTask;
 use crate::minecraft::loader::installer::{LoaderInstallError, ModLoaderInstaller};
 use crate::minecraft::loaders::ModLoaderType;
 use crate::minecraft::version::VersionInfo;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 use tracing::{debug, info};
+
+const PAPER_FILL_BASE: &str = "https://fill.papermc.io/v3/projects/paper";
+const PAPER_USER_AGENT: &str = "JLUCraft-minecraftd/1.0 (https://github.com/JLUCraft/minecraftd)";
+const PAPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const PAPER_MAX_JAR_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct PaperBuild {
+    id: u64,
+    channel: PaperChannel,
+    downloads: BTreeMap<String, PaperDownload>,
+}
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PaperChannel {
+    Stable,
+    #[serde(other)]
+    Other,
+}
+#[derive(Debug, Deserialize)]
+struct PaperDownload {
+    url: String,
+    size: u64,
+    checksums: PaperChecksums,
+}
+#[derive(Debug, Deserialize)]
+struct PaperChecksums {
+    sha256: String,
+}
+
+fn paper_client() -> Result<reqwest::Client, LoaderInstallError> {
+    Ok(reqwest::Client::builder()
+        .user_agent(PAPER_USER_AGENT)
+        .timeout(PAPER_REQUEST_TIMEOUT)
+        .build()?)
+}
+fn latest_stable(builds: &[PaperBuild]) -> Result<String, LoaderInstallError> {
+    builds
+        .iter()
+        .filter(|build| build.channel == PaperChannel::Stable)
+        .map(|build| build.id)
+        .max()
+        .map(|id| id.to_string())
+        .ok_or_else(|| LoaderInstallError::VersionNotFound("no stable Paper build".to_string()))
+}
+fn verify_paper_bytes(download: &PaperDownload, bytes: &[u8]) -> Result<(), LoaderInstallError> {
+    let checksum: String = hex::encode(Sha256::digest(bytes));
+    if download.size != bytes.len() as u64 || download.checksums.sha256 != checksum {
+        return Err(LoaderInstallError::InstallFailed(
+            "Paper download size/SHA-256 mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 const PAPER_API_BASE: &str = "https://api.papermc.io/v2/projects";
 
@@ -75,7 +133,10 @@ impl PaperInstaller {
         Self::new(PaperPlatform::Purpur)
     }
 
-    /// Returns the download URL for a specific build.
+    /// Download URL for the classic v2-style artifact listing, used by
+    /// `install` for Spigot/Purpur. Paper itself ignores this: its downloads
+    /// are retired (HTTP 410) and the real artifact is resolved and verified
+    /// through Fill v3 in `download_paper` instead.
     #[must_use]
     pub fn download_url(&self, mc_version: &str, build: &str) -> String {
         match self.platform {
@@ -108,6 +169,20 @@ impl PaperInstaller {
 
     /// Fetches the latest successful build number for a Minecraft version.
     pub async fn fetch_latest_build(&self, mc_version: &str) -> Result<String, LoaderInstallError> {
+        if self.platform == PaperPlatform::Paper {
+            let url: String = format!(
+                "{PAPER_FILL_BASE}/versions/{}/builds",
+                urlencoding::encode(mc_version)
+            );
+            let builds: Vec<PaperBuild> = paper_client()?
+                .get(url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            return latest_stable(&builds);
+        }
         let url = match self.platform {
             PaperPlatform::Paper | PaperPlatform::Spigot => {
                 format!(
@@ -166,6 +241,61 @@ impl PaperInstaller {
         Ok(latest.to_string())
     }
 
+    async fn download_paper(
+        &self,
+        mc_version: &str,
+        build: &str,
+        destination: &Path,
+    ) -> Result<(), LoaderInstallError> {
+        let client: reqwest::Client = paper_client()?;
+        let url: String = format!(
+            "{PAPER_FILL_BASE}/versions/{}/builds/{}",
+            urlencoding::encode(mc_version),
+            urlencoding::encode(build)
+        );
+        let metadata: PaperBuild = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if metadata.id.to_string() != build {
+            return Err(LoaderInstallError::Parse(
+                "Paper build mismatch".to_string(),
+            ));
+        }
+        let download: &PaperDownload =
+            metadata.downloads.get("server:default").ok_or_else(|| {
+                LoaderInstallError::Parse("missing Paper server download".to_string())
+            })?;
+        let parsed: url::Url = url::Url::parse(&download.url)
+            .map_err(|error| LoaderInstallError::Parse(error.to_string()))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str() != Some("fill-data.papermc.io")
+            || download.size > PAPER_MAX_JAR_BYTES
+        {
+            return Err(LoaderInstallError::Parse(
+                "invalid Paper artifact metadata".to_string(),
+            ));
+        }
+        let mut response: reqwest::Response =
+            client.get(parsed).send().await?.error_for_status()?;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if (bytes.len() as u64).saturating_add(chunk.len() as u64) > download.size {
+                return Err(LoaderInstallError::InstallFailed(
+                    "Paper download exceeds declared size".to_string(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        verify_paper_bytes(download, &bytes)?;
+        // Verify before touching the installed jar; failed upstream responses cannot overwrite it.
+        tokio::fs::write(destination, &bytes).await?;
+        Ok(())
+    }
+
     /// Creates a synthetic `VersionInfo` for a Paper-based server.
     ///
     /// Paper servers don't use Mojang's version JSON — they are self-contained
@@ -221,6 +351,11 @@ impl ModLoaderInstaller for PaperInstaller {
             build
         ));
 
+        if self.platform == PaperPlatform::Paper {
+            self.download_paper(mc_version, &build, &server_jar).await?;
+            return Ok(self.synthetic_version_info(mc_version, &build));
+        }
+
         debug!(
             "downloading {} server from {}",
             self.platform.display_name(),
@@ -245,6 +380,31 @@ impl ModLoaderInstaller for PaperInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_selection_and_artifact_integrity() -> Result<(), LoaderInstallError> {
+        let builds: Vec<PaperBuild> = serde_json::from_str(
+            r#"[
+            {"id":10,"channel":"EXPERIMENTAL","downloads":{}},
+            {"id":8,"channel":"STABLE","downloads":{}},
+            {"id":9,"channel":"STABLE","downloads":{}}
+        ]"#,
+        )?;
+        assert_eq!(latest_stable(&builds)?, "9");
+        assert!(latest_stable(&builds[..1]).is_err());
+        let bytes: &[u8] = b"verified server jar fixture";
+        let metadata: PaperDownload = PaperDownload {
+            url: String::new(),
+            size: bytes.len() as u64,
+            checksums: PaperChecksums {
+                sha256: hex::encode(Sha256::digest(bytes)),
+            },
+        };
+        verify_paper_bytes(&metadata, bytes)?;
+        assert!(verify_paper_bytes(&metadata, b"altered server jar fixture!").is_err());
+        assert!(verify_paper_bytes(&metadata, &bytes[..bytes.len() - 1]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_paper_installer_platforms() {
@@ -307,15 +467,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Tests that `install()` with a numeric build number skips the API fetch
-    /// and attempts direct download (which will fail without network).
+    /// An explicit nonexistent build must fail without silently selecting latest.
     #[tokio::test]
-    async fn test_paper_install_with_numeric_build_skips_api() {
+    async fn test_paper_unknown_numeric_build_rejected() {
         let installer = PaperInstaller::paper();
         let tmpdir = tempfile::tempdir().unwrap();
-        // "12345" is numeric, so it should skip fetch_latest_build and go straight to download
+        // Numeric selection skips latest resolution, but still needs artifact metadata.
         let result = installer.install("1.20.4", "12345", tmpdir.path()).await;
-        // Should fail at download step (no network), not at API fetch
+        // Unknown metadata cannot produce a usable artifact.
         assert!(result.is_err());
         let err = result.unwrap_err().to_string().to_lowercase();
         assert!(

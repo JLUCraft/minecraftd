@@ -320,7 +320,9 @@ mod tests {
     fn test_natives_dir() {
         let dir = ArgumentEngine::natives_dir(Path::new("/game"), "1.20.4");
         let lossy = dir.to_string_lossy();
-        assert!(lossy.contains("versions") && lossy.contains("1.20.4") && lossy.contains("natives"));
+        assert!(
+            lossy.contains("versions") && lossy.contains("1.20.4") && lossy.contains("natives")
+        );
     }
 
     #[test]
