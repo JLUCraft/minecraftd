@@ -68,6 +68,61 @@ pub fn discover() -> Vec<DiscoveredInstance> {
     scan_dirs(&minecraft_base_dirs())
 }
 
+/// Discover version-isolated client instances under the given base directories.
+///
+/// Unlike [`discover`], this only scans `versions/<id>/` subdirectories and
+/// applies the strict launcher-style validation (`<id>.jar` and `<id>.json`
+/// both present), so worlds and loose directories are never reported.
+///
+/// Base directories without a `versions/` subdirectory are silently skipped.
+#[must_use]
+pub fn scan_version_instances(bases: &[PathBuf]) -> Vec<DiscoveredInstance> {
+    let mut instances: Vec<DiscoveredInstance> = Vec::new();
+
+    for base in bases {
+        let versions_dir = base.join("versions");
+        if versions_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&versions_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let id = file_name(&path);
+
+                // Strict client validation: both `<id>.jar` and `<id>.json`.
+                if !path.join(format!("{id}.jar")).is_file()
+                    || !path.join(format!("{id}.json")).is_file()
+                {
+                    continue;
+                }
+
+                let instance_saves = path.join(InstanceSubdir::Saves.dir_name());
+                let mut worlds: Vec<String> = Vec::new();
+                if let Ok(save_entries) = std::fs::read_dir(&instance_saves) {
+                    for save_entry in save_entries.flatten() {
+                        let save_path = save_entry.path();
+                        if save_path.is_dir() && save_path.join("level.dat").is_file() {
+                            worlds.push(file_name(&save_path));
+                        }
+                    }
+                }
+
+                instances.push(DiscoveredInstance {
+                    id,
+                    path,
+                    kind: InstanceKind::Client,
+                    worlds,
+                });
+            }
+        }
+    }
+
+    instances.sort_by(|a, b| a.id.cmp(&b.id));
+    instances
+}
+
 /// List of well-known directories that are scanned by `discover()`.
 pub fn known_dirs() -> Vec<PathBuf> {
     minecraft_base_dirs()
@@ -388,5 +443,45 @@ mod tests {
             assert!(!inst.id.is_empty());
             assert!(inst.path.is_dir());
         }
+    }
+
+    #[test]
+    fn test_scan_version_instances_requires_jar_and_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path();
+        let versions = base.join("versions");
+        let valid = versions.join("1.20.4");
+        let jar_only = versions.join("jar-only");
+        let json_only = versions.join("json-only");
+        std::fs::create_dir_all(&valid).expect("create valid dir");
+        std::fs::create_dir_all(&jar_only).expect("create jar-only dir");
+        std::fs::create_dir_all(&json_only).expect("create json-only dir");
+
+        std::fs::write(valid.join("1.20.4.jar"), b"jar").expect("write jar");
+        std::fs::write(valid.join("1.20.4.json"), b"{}").expect("write json");
+        std::fs::write(jar_only.join("jar-only.jar"), b"jar").expect("write jar");
+        std::fs::write(json_only.join("json-only.json"), b"{}").expect("write json");
+
+        // A valid world inside the valid instance is reported as its world.
+        let saves = valid.join("saves").join("myworld");
+        std::fs::create_dir_all(&saves).expect("create world dir");
+        std::fs::write(saves.join("level.dat"), b"nbt").expect("write level.dat");
+
+        let instances = scan_version_instances(&[base.to_path_buf()]);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, "1.20.4");
+        assert_eq!(instances[0].kind, InstanceKind::Client);
+        assert_eq!(instances[0].path, valid);
+        assert_eq!(instances[0].worlds, vec!["myworld".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_version_instances_skips_missing_versions_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("no-versions-here");
+        std::fs::create_dir_all(&base).expect("create base dir");
+
+        let instances = scan_version_instances(&[base]);
+        assert!(instances.is_empty());
     }
 }
