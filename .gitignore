@@ -1,4 +1,5 @@
-/target*.key
+/target/
+*.key
 *.pem
 .env
 __pycache__/
