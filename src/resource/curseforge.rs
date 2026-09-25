@@ -1,3 +1,8 @@
+use crate::resource::http::ResourceTransport;
+use crate::resource::models::{
+    OtherResourceFileInfo, OtherResourceSearchQuery, OtherResourceSearchRes,
+    OtherResourceVersionPack, OtherResourceVersionPackQuery,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,8 +16,8 @@ const TRANSLATE_BASE: &str = "https://mod.mcimirror.top/translate/curseforge";
 
 /// A CurseForge API client.
 #[derive(Debug, Clone)]
-pub struct CurseForgeClient {
-    client: Client,
+pub struct CurseForgeClient<C = Client> {
+    client: C,
     api_key: String,
 }
 
@@ -35,7 +40,111 @@ impl CurseForgeClient {
             .ok()
             .map(Self::new)
     }
+}
 
+impl<C: ResourceTransport> CurseForgeClient<C> {
+    pub const fn with_client(client: C, api_key: String) -> Self {
+        Self { client, api_key }
+    }
+
+    pub async fn search_resources(
+        &self,
+        query: &OtherResourceSearchQuery,
+    ) -> Result<OtherResourceSearchRes, ResourceError> {
+        use crate::resource::presentation::{
+            cvt_category_to_id, cvt_sort_by_to_id, cvt_type_to_class_id,
+        };
+        let class = cvt_type_to_class_id(&query.resource_type);
+        let sort = cvt_sort_by_to_id(&query.sort_by);
+        Ok(self
+            .search_mods(&SearchModsQuery {
+                class_id: Some(class),
+                search_filter: query.search_query.clone(),
+                game_version: filter_value(&query.game_version),
+                category_id: filter_value(&query.selected_tag)
+                    .map(|tag| cvt_category_to_id(&tag, class)),
+                sort_field: sort,
+                sort_order: if sort == 4 {
+                    "asc".into()
+                } else {
+                    "desc".into()
+                },
+                index: query
+                    .page
+                    .checked_mul(query.page_size)
+                    .ok_or_else(|| ResourceError::Parse("page overflow".into()))?,
+                page_size: query.page_size,
+                ..Default::default()
+            })
+            .await?
+            .into())
+    }
+    pub async fn version_packs(
+        &self,
+        query: &OtherResourceVersionPackQuery,
+    ) -> Result<Vec<OtherResourceVersionPack>, ResourceError> {
+        const PAGE_SIZE: u32 = 50;
+        let id: u64 = query
+            .resource_id
+            .parse()
+            .map_err(|error: std::num::ParseIntError| ResourceError::Parse(error.to_string()))?;
+        let mut files = Vec::new();
+        let mut index = 0u32;
+        loop {
+            let response = self
+                .get_mod_files_page(
+                    id,
+                    &FilesQuery {
+                        mod_loader_type: filter_value(&query.mod_loader).map(|loader| {
+                            crate::resource::presentation::cvt_mod_loader_to_id(&loader)
+                        }),
+                        game_version: query
+                            .game_versions
+                            .first()
+                            .and_then(|value| filter_value(value)),
+                        index,
+                        page_size: PAGE_SIZE,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let empty = response.data.is_empty();
+            files.extend(response.data);
+            index = index
+                .checked_add(PAGE_SIZE)
+                .ok_or_else(|| ResourceError::Parse("pagination overflow".into()))?;
+            if empty || u64::from(index) >= response.pagination.total_count {
+                break;
+            }
+        }
+        Ok(crate::resource::presentation::map_curseforge_file_to_version_pack(files))
+    }
+    pub async fn identify_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<OtherResourceFileInfo, ResourceError> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|error| ResourceError::Parse(error.to_string()))?;
+        let sha1 = crate::util::hash::sha1_bytes(&bytes);
+        let filtered: Vec<u8> = bytes
+            .into_iter()
+            .filter(|byte| !matches!(byte, 0x09 | 0x0a | 0x0d | 0x20))
+            .collect();
+        let fingerprint = u64::from(murmur2::murmur2(&filtered, 1));
+        let result = self.get_mods_by_fingerprints(&[fingerprint]).await?;
+        let file = result
+            .exact_matches
+            .iter()
+            .map(|entry| &entry.file)
+            .find(|file| {
+                file.hashes
+                    .iter()
+                    .any(|hash| hash.algo == 1 && hash.value.eq_ignore_ascii_case(&sha1))
+            })
+            .ok_or_else(|| ResourceError::Parse("no verified fingerprint match".into()))?;
+        Ok((file, None).into())
+    }
     /// Searches for mods on CurseForge.
     ///
     /// # Errors
@@ -66,23 +175,12 @@ impl CurseForgeClient {
         params.insert("index".to_string(), query.index.to_string());
         params.insert("pageSize".to_string(), query.page_size.to_string());
 
-        let resp = self
+        let response = self
             .client
-            .get(&url)
-            .query(&params)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &params, None, Some(&self.api_key))
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from CurseForge search",
-                resp.status()
-            )));
-        }
-
-        let data: SearchResponse = resp.json().await?;
+        let data: SearchResponse = serde_json::from_value(response)?;
         Ok(data.into())
     }
 
@@ -93,22 +191,12 @@ impl CurseForgeClient {
     /// Returns `ResourceError` on network or parse failures.
     pub async fn get_mod(&self, mod_id: u64) -> Result<CurseForgeProject, ResourceError> {
         let url = format!("{BASE_URL}/mods/{mod_id}");
-        let resp = self
+        let response = self
             .client
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &HashMap::new(), None, Some(&self.api_key))
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from CurseForge get_mod",
-                resp.status()
-            )));
-        }
-
-        let data: GetProjectResponse = resp.json().await?;
+        let data: GetProjectResponse = serde_json::from_value(response)?;
         Ok(data.data)
     }
 
@@ -122,6 +210,13 @@ impl CurseForgeClient {
         mod_id: u64,
         query: &FilesQuery,
     ) -> Result<Vec<CurseForgeFile>, ResourceError> {
+        Ok(self.get_mod_files_page(mod_id, query).await?.data)
+    }
+    pub async fn get_mod_files_page(
+        &self,
+        mod_id: u64,
+        query: &FilesQuery,
+    ) -> Result<FilesResponse, ResourceError> {
         let url = format!("{BASE_URL}/mods/{mod_id}/files");
         let mut params = HashMap::new();
         if let Some(loader) = query.mod_loader_type {
@@ -130,27 +225,19 @@ impl CurseForgeClient {
         if let Some(version) = &query.game_version_type_id {
             params.insert("gameVersionTypeId".to_string(), version.to_string());
         }
+        if let Some(version) = &query.game_version {
+            params.insert("gameVersion".into(), version.clone());
+        }
         params.insert("index".to_string(), query.index.to_string());
         params.insert("pageSize".to_string(), query.page_size.to_string());
 
-        let resp = self
+        let response = self
             .client
-            .get(&url)
-            .query(&params)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &params, None, Some(&self.api_key))
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from CurseForge get_mod_files",
-                resp.status()
-            )));
-        }
-
-        let data: FilesResponse = resp.json().await?;
-        Ok(data.data)
+        let data: FilesResponse = serde_json::from_value(response)?;
+        Ok(data)
     }
 
     /// Gets information about a single file.
@@ -164,22 +251,12 @@ impl CurseForgeClient {
         file_id: u64,
     ) -> Result<CurseForgeFile, ResourceError> {
         let url = format!("{BASE_URL}/mods/{mod_id}/files/{file_id}");
-        let resp = self
+        let response = self
             .client
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &HashMap::new(), None, Some(&self.api_key))
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from CurseForge get_file_info",
-                resp.status()
-            )));
-        }
-
-        let data: FileResponse = resp.json().await?;
+        let data: FileResponse = serde_json::from_value(response)?;
         Ok(data.data)
     }
 
@@ -195,23 +272,12 @@ impl CurseForgeClient {
         let url = format!("{BASE_URL}/fingerprints/{GAME_ID}");
         let payload = json!({ "fingerprints": fingerprints });
 
-        let resp = self
+        let response = self
             .client
-            .post(&url)
-            .json(&payload)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &HashMap::new(), Some(&payload), Some(&self.api_key))
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from CurseForge fingerprints",
-                resp.status()
-            )));
-        }
-
-        let data: FingerprintResponse = resp.json().await?;
+        let data: FingerprintResponse = serde_json::from_value(response)?;
         Ok(data.data)
     }
 
@@ -227,23 +293,25 @@ impl CurseForgeClient {
         mod_id: u64,
     ) -> Result<Option<String>, ResourceError> {
         let url = format!("{TRANSLATE_BASE}/{mod_id}");
-        let result = self
+        let response = self
             .client
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
-
-        if !result.status().is_success() {
-            return Ok(None);
-        }
-
-        let translation: TranslationResponse = match result.json().await {
-            Ok(t) => t,
+            .request_json(&url, &HashMap::new(), None, Some(&self.api_key))
+            .await;
+        let translation: TranslationResponse = match response
+            .and_then(|value| serde_json::from_value(value).map_err(ResourceError::from))
+        {
+            Ok(translation) => translation,
             Err(_) => return Ok(None),
         };
         Ok(Some(translation.translated))
+    }
+}
+
+fn filter_value(value: &str) -> Option<String> {
+    if value.is_empty() || value == "All" {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 
@@ -282,6 +350,7 @@ impl SearchModsQuery {
 /// Parameters for `get_mod_files`.
 #[derive(Debug, Clone, Default)]
 pub struct FilesQuery {
+    pub game_version: Option<String>,
     pub mod_loader_type: Option<u32>,
     pub game_version_type_id: Option<u32>,
     pub index: u32,
@@ -293,6 +362,7 @@ pub struct FilesQuery {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeProject {
     pub id: i32,
     pub class_id: Option<i32>,
@@ -308,26 +378,31 @@ pub struct CurseForgeProject {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeLinks {
     pub website_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeCategory {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeLogo {
     pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeAuthor {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeFile {
     pub id: i32,
     pub mod_id: i32,
@@ -343,18 +418,21 @@ pub struct CurseForgeFile {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeHash {
     pub value: String,
     pub algo: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgeDependency {
     pub mod_id: i32,
     pub relation_type: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CurseForgePagination {
     pub index: u32,
     pub page_size: u32,
@@ -363,15 +441,17 @@ pub struct CurseForgePagination {
 
 /// Result of a `search_mods` call.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchResult {
     pub data: Vec<CurseForgeProject>,
     pub pagination: CurseForgePagination,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchResponse {
-    data: Vec<CurseForgeProject>,
-    pagination: CurseForgePagination,
+    pub data: Vec<CurseForgeProject>,
+    pub pagination: CurseForgePagination,
 }
 
 impl From<SearchResponse> for SearchResult {
@@ -384,38 +464,45 @@ impl From<SearchResponse> for SearchResult {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct GetProjectResponse {
-    data: CurseForgeProject,
+#[serde(rename_all = "camelCase")]
+pub struct GetProjectResponse {
+    pub data: CurseForgeProject,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct FilesResponse {
-    data: Vec<CurseForgeFile>,
-    pagination: CurseForgePagination,
+#[serde(rename_all = "camelCase")]
+pub struct FilesResponse {
+    pub data: Vec<CurseForgeFile>,
+    pub pagination: CurseForgePagination,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FileResponse {
-    data: CurseForgeFile,
+    pub data: CurseForgeFile,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct FingerprintResponse {
-    data: FingerprintResult,
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintResponse {
+    pub data: FingerprintResult,
 }
 
 /// Fingerprint lookup result.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FingerprintResult {
     pub exact_matches: Vec<ExactMatch>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExactMatch {
     pub file: CurseForgeFile,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TranslationResponse {
     translated: String,
 }
@@ -458,6 +545,13 @@ pub fn fallback_download_url(file_id: i32, file_name: &str) -> String {
         file_id / 1000,
         file_id % 1000,
         urlencoding::encode(file_name)
+    )
+}
+
+pub fn is_curseforge_authenticated_url(url: &url::Url) -> bool {
+    matches!(
+        url.host_str(),
+        Some("api.curseforge.com" | "edge.forgecdn.net" | "mediafilez.forgecdn.net")
     )
 }
 

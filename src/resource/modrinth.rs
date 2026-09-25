@@ -1,3 +1,8 @@
+use crate::resource::http::ResourceTransport;
+use crate::resource::models::{
+    OtherResourceFileInfo, OtherResourceSearchQuery, OtherResourceSearchRes,
+    OtherResourceVersionPack, OtherResourceVersionPackQuery,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,8 +14,8 @@ const TRANSLATE_BASE: &str = "https://mod.mcimirror.top/translate/modrinth";
 
 /// A Modrinth API client.
 #[derive(Debug, Clone)]
-pub struct ModrinthClient {
-    client: Client,
+pub struct ModrinthClient<C = Client> {
+    client: C,
 }
 
 impl ModrinthClient {
@@ -21,7 +26,112 @@ impl ModrinthClient {
             client: Client::new(),
         }
     }
+}
 
+impl<C: ResourceTransport> ModrinthClient<C> {
+    pub const fn with_client(client: C) -> Self {
+        Self { client }
+    }
+
+    pub async fn search_resources(
+        &self,
+        query: &OtherResourceSearchQuery,
+    ) -> Result<OtherResourceSearchRes, ResourceError> {
+        let result = self
+            .search_projects(&SearchQuery {
+                query: query.search_query.clone(),
+                project_type: query.resource_type.clone(),
+                game_version: filter_value(&query.game_version),
+                categories: filter_value(&query.selected_tag).map(|tag| vec![tag]),
+                offset: query
+                    .page
+                    .checked_mul(query.page_size)
+                    .ok_or_else(|| ResourceError::Parse("page overflow".into()))?,
+                limit: query.page_size,
+                index: query.sort_by.clone(),
+            })
+            .await?;
+        Ok(result.into())
+    }
+    pub async fn version_packs(
+        &self,
+        query: &OtherResourceVersionPackQuery,
+    ) -> Result<Vec<OtherResourceVersionPack>, ResourceError> {
+        let loader = filter_value(&query.mod_loader).map(|value| value.to_lowercase());
+        let loaders = loader.as_deref().map(|loader| vec![loader]);
+        let versions = query
+            .game_versions
+            .iter()
+            .filter(|value| !value.is_empty() && value.as_str() != "All")
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let versions = if versions.is_empty() {
+            None
+        } else {
+            Some(versions.as_slice())
+        };
+        Ok(
+            crate::resource::presentation::map_modrinth_file_to_version_pack(
+                self.get_project_versions(&query.resource_id, loaders.as_deref(), versions)
+                    .await?,
+                &query.resource_type,
+            ),
+        )
+    }
+    pub async fn identify_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<OtherResourceFileInfo, ResourceError> {
+        let hash = crate::util::hash::sha1_file(path)
+            .await
+            .map_err(|error| ResourceError::Parse(error.to_string()))?;
+        let version = self.get_version_file(&hash, "sha1").await?;
+        let file = version
+            .files
+            .iter()
+            .find(|file| file.hashes.sha1.eq_ignore_ascii_case(&hash))
+            .ok_or_else(|| ResourceError::Parse("remote file SHA1 mismatch".into()))?;
+        Ok((&version, file, version.loaders.first().cloned()).into())
+    }
+    pub async fn latest_download(
+        &self,
+        project: &str,
+        loader: crate::minecraft::loaders::ModLoaderType,
+        game_version: &str,
+        directory: &std::path::Path,
+    ) -> Result<Option<crate::download::request::DownloadParam>, ResourceError> {
+        let packs = self
+            .version_packs(&OtherResourceVersionPackQuery {
+                resource_id: project.into(),
+                mod_loader: loader.to_string(),
+                game_versions: vec![game_version.into()],
+                resource_type: String::new(),
+            })
+            .await?;
+        let Some(pack) = packs.first() else {
+            return Ok(None);
+        };
+        let Some(file) = pack
+            .items
+            .iter()
+            .filter(|file| matches!(file.release_type.as_str(), "release" | "beta"))
+            .max_by(|a, b| a.file_date.cmp(&b.file_date))
+        else {
+            return Ok(None);
+        };
+        if std::path::Path::new(&file.file_name).components().count() != 1
+            || file.file_name.contains(['/', '\\'])
+            || matches!(file.file_name.as_str(), "." | ".." | "")
+        {
+            return Err(ResourceError::Parse("invalid remote file name".into()));
+        }
+        Ok(Some(crate::download::request::DownloadParam {
+            src: file.download_url.parse()?,
+            dest: directory.join(&file.file_name),
+            filename: Some(file.file_name.clone()),
+            sha1: Some(file.sha1.clone()),
+        }))
+    }
     /// Searches for projects on Modrinth.
     ///
     /// # Errors
@@ -52,23 +162,9 @@ impl ModrinthClient {
         params.insert("limit".to_string(), query.limit.to_string());
         params.insert("index".to_string(), query.index.clone());
 
-        let resp = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+        let response = self.client.request_json(&url, &params, None, None).await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from Modrinth search",
-                resp.status()
-            )));
-        }
-
-        let data: SearchResponse = resp.json().await?;
-        Ok(data.into())
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Gets a single project by ID or slug.
@@ -78,21 +174,12 @@ impl ModrinthClient {
     /// Returns `ResourceError` on network or parse failures.
     pub async fn get_project(&self, project_id: &str) -> Result<ModrinthProject, ResourceError> {
         let url = format!("{BASE_URL}/project/{project_id}");
-        let resp = self
+        let response = self
             .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+            .request_json(&url, &HashMap::new(), None, None)
+            .await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from Modrinth get_project",
-                resp.status()
-            )));
-        }
-
-        Ok(resp.json().await?)
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Gets all versions for a project, optionally filtered.
@@ -109,48 +196,15 @@ impl ModrinthClient {
         let url = format!("{BASE_URL}/project/{project_id}/version");
         let mut params = HashMap::new();
         if let Some(loaders) = loaders {
-            params.insert(
-                "loaders".to_string(),
-                format!(
-                    "[{}]",
-                    loaders
-                        .iter()
-                        .map(|s| format!("\"{s}\""))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-            );
+            params.insert("loaders".to_owned(), serde_json::to_string(loaders)?);
         }
         if let Some(versions) = game_versions {
-            params.insert(
-                "game_versions".to_string(),
-                format!(
-                    "[{}]",
-                    versions
-                        .iter()
-                        .map(|s| format!("\"{s}\""))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-            );
+            params.insert("game_versions".to_owned(), serde_json::to_string(versions)?);
         }
 
-        let resp = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+        let response = self.client.request_json(&url, &params, None, None).await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from Modrinth get_project_versions",
-                resp.status()
-            )));
-        }
-
-        Ok(resp.json().await?)
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Gets a version file by its hash.
@@ -167,22 +221,9 @@ impl ModrinthClient {
         let mut params = HashMap::new();
         params.insert("algorithm".to_string(), algorithm.to_string());
 
-        let resp = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
+        let response = self.client.request_json(&url, &params, None, None).await?;
 
-        if !resp.status().is_success() {
-            return Err(ResourceError::Api(format!(
-                "HTTP {} from Modrinth get_version_file",
-                resp.status()
-            )));
-        }
-
-        Ok(resp.json().await?)
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Finds the latest version of a project matching the given criteria.
@@ -217,19 +258,14 @@ impl ModrinthClient {
         project_id: &str,
     ) -> Result<Option<String>, ResourceError> {
         let url = format!("{TRANSLATE_BASE}/{project_id}");
-        let result = self
+        let response = self
             .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ResourceError::Network(e.to_string()))?;
-
-        if !result.status().is_success() {
-            return Ok(None);
-        }
-
-        let translation: TranslationResponse = match result.json().await {
-            Ok(t) => t,
+            .request_json(&url, &HashMap::new(), None, None)
+            .await;
+        let translation: TranslationResponse = match response
+            .and_then(|value| serde_json::from_value(value).map_err(ResourceError::from))
+        {
+            Ok(translation) => translation,
             Err(_) => return Ok(None),
         };
         Ok(Some(translation.translated))
@@ -239,6 +275,14 @@ impl ModrinthClient {
 impl Default for ModrinthClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn filter_value(value: &str) -> Option<String> {
+    if value.is_empty() || value == "All" {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 
@@ -300,33 +344,7 @@ pub struct ModrinthSearchRes {
     pub limit: u32,
 }
 
-/// Result of a `search_projects` call.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SearchResult {
-    pub hits: Vec<ModrinthProject>,
-    pub total_hits: u64,
-    pub offset: u32,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SearchResponse {
-    hits: Vec<ModrinthProject>,
-    pub total_hits: u64,
-    pub offset: u32,
-    pub limit: u32,
-}
-
-impl From<SearchResponse> for SearchResult {
-    fn from(resp: SearchResponse) -> Self {
-        Self {
-            hits: resp.hits,
-            total_hits: resp.total_hits,
-            offset: resp.offset,
-            limit: resp.limit,
-        }
-    }
-}
+pub type SearchResult = ModrinthSearchRes;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModrinthVersion {
@@ -349,6 +367,8 @@ pub struct ModrinthDependency {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModrinthFile {
+    #[serde(default)]
+    pub primary: bool,
     pub url: String,
     pub filename: String,
     pub hashes: ModrinthFileHashes,
@@ -357,6 +377,7 @@ pub struct ModrinthFile {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModrinthFileHashes {
     pub sha1: String,
+    #[serde(default)]
     pub sha512: String,
 }
 
