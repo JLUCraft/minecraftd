@@ -112,15 +112,20 @@ async fn main() {
 
 async fn run_daemon() {
     let daemon = daemon::Daemon::new();
-    daemon.run().await;
+    if let Err(error) = daemon.run().await {
+        tracing::error!(%error, "daemon stopped");
+        process::exit(1);
+    }
 }
 
 /// Try to connect to the daemon. Returns Ok(stream) or the error.
 async fn connect() -> Result<Stream, String> {
-    let name = daemon::socket_name();
-    Stream::connect(name)
+    let name = daemon::socket_name().map_err(|e| e.to_string())?;
+    let stream = Stream::connect(name)
         .await
-        .map_err(|e| format!("connect to daemon: {e}"))
+        .map_err(|e| format!("connect to daemon: {e}"))?;
+    daemon::authorize_peer(&stream).map_err(|e| e.to_string())?;
+    Ok(stream)
 }
 
 async fn send_to_daemon(command: &Commands) -> Result<(), String> {

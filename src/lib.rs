@@ -24,6 +24,8 @@ pub mod util;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("local IPC error: {0}")]
+    Ipc(#[from] std::io::Error),
     #[error("instance error: {0}")]
     Instance(#[from] instance::base::InstanceError),
     #[error("state error: {0}")]
