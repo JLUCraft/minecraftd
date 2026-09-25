@@ -23,60 +23,43 @@ impl DownloadSource {
         }
     }
 
-    /// Rewrites a Mojang URL to use this source.
-    ///
-    /// Backward-compatible string-replacement approach.
+    /// Rewrites supported resource URLs using the shared endpoint catalog.
     #[must_use]
     pub fn rewrite_url(&self, original: &str) -> String {
+        let Ok(url) = Url::parse(original) else {
+            return original.to_owned();
+        };
         match self {
-            Self::Official => original.to_string(),
-            Self::Bmclapi => {
-                // BMCLAPI mirrors Mojang's resources
-                original
-                    .replace(
-                        "https://launchermeta.mojang.com",
-                        "https://bmclapi2.bangbang93.com",
-                    )
-                    .replace(
-                        "https://launcher.mojang.com",
-                        "https://bmclapi2.bangbang93.com",
-                    )
-                    .replace(
-                        "https://piston-meta.mojang.com",
-                        "https://bmclapi2.bangbang93.com",
-                    )
-                    .replace(
-                        "https://piston-data.mojang.com",
-                        "https://bmclapi2.bangbang93.com",
-                    )
-                    .replace(
-                        "https://libraries.minecraft.net",
-                        "https://bmclapi2.bangbang93.com/maven",
-                    )
-                    .replace(
-                        "https://resources.download.minecraft.net",
-                        "https://bmclapi2.bangbang93.com/assets",
-                    )
-            }
+            Self::Official => original.to_owned(),
+            Self::Bmclapi => convert_url_to_target_source(&url, &[], &SourceType::Bmclapi)
+                .unwrap_or(url)
+                .to_string(),
             Self::Custom(base) => {
-                // For custom mirrors, only rewrite known Mojang domains
-                if original.starts_with("https://") {
-                    let domains = [
-                        "launchermeta.mojang.com",
-                        "launcher.mojang.com",
-                        "piston-meta.mojang.com",
-                        "piston-data.mojang.com",
-                        "libraries.minecraft.net",
-                        "resources.download.minecraft.net",
-                    ];
-                    for domain in &domains {
-                        if original.contains(domain) {
-                            return original
-                                .replace(&format!("https://{domain}"), base.trim_end_matches('/'));
-                        }
-                    }
+                let known = crate::resource::ResourceType::iter()
+                    .filter_map(|resource| {
+                        crate::resource::get_download_api(SourceType::Official, resource).ok()
+                    })
+                    .any(|endpoint| endpoint.origin() == url.origin());
+                if known
+                    || matches!(
+                        url.host_str(),
+                        Some("piston-meta.mojang.com" | "piston-data.mojang.com")
+                    )
+                {
+                    let Ok(mut target) = Url::parse(base) else {
+                        return original.to_owned();
+                    };
+                    target.set_path(&format!(
+                        "{}{}",
+                        target.path().trim_end_matches('/'),
+                        url.path()
+                    ));
+                    target.set_query(url.query());
+                    target.set_fragment(url.fragment());
+                    target.to_string()
+                } else {
+                    original.to_owned()
                 }
-                original.to_string()
             }
         }
     }
@@ -105,7 +88,9 @@ impl DownloadSource {
                         return converted.to_string();
                     }
                     // Fallback to generic conversion
-                    convert_url_to_target_source(&url, SourceType::Bmclapi).to_string()
+                    convert_url_to_target_source(&url, &[], &SourceType::Bmclapi)
+                        .unwrap_or(url)
+                        .to_string()
                 } else {
                     original.to_string()
                 }
@@ -182,5 +167,18 @@ mod tests {
             DownloadSource::Custom("https://x.com".to_string()).to_source_type(),
             None
         );
+    }
+
+    #[test]
+    fn rejects_lookalike_origins() {
+        for source in [
+            DownloadSource::Bmclapi,
+            DownloadSource::Custom("https://mirror.example".into()),
+        ] {
+            let malicious = "https://libraries.minecraft.net.evil.example/library.jar";
+            assert_eq!(source.rewrite_url(malicious), malicious);
+            let indirect = "https://example.org/?url=https://libraries.minecraft.net/library.jar";
+            assert_eq!(source.rewrite_url(indirect), indirect);
+        }
     }
 }
