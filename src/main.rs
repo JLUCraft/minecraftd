@@ -1,7 +1,7 @@
 #![deny(warnings)]
 #![warn(single_use_lifetimes)]
 #![warn(clippy::nursery)]
-#![warn(clippy::unwrap_used)]
+#![deny(clippy::unwrap_used)]
 #![warn(clippy::panic)]
 #![warn(clippy::todo)]
 
