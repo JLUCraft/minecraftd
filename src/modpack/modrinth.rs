@@ -57,17 +57,7 @@ impl ModpackManifest for ModrinthManifest {
     where
         Self: Sized,
     {
-        let file = std::fs::File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| ModpackError::Parse(format!("invalid zip: {e}")))?;
-        let mut manifest_file = archive
-            .by_name("modrinth.index.json")
-            .map_err(|_| ModpackError::Parse("modrinth.index.json not found".to_string()))?;
-        let mut content = String::new();
-        std::io::Read::read_to_string(&mut manifest_file, &mut content)
-            .map_err(|e| ModpackError::Io(e.to_string()))?;
-        let manifest: Self = serde_json::from_str(&content)?;
-        Ok(manifest)
+        crate::modpack::read_manifest(&std::fs::File::open(path)?, "modrinth.index.json")
     }
 
     fn client_version(&self) -> Result<String, ModpackError> {
@@ -95,27 +85,75 @@ impl ModpackManifest for ModrinthManifest {
         &self,
         instance_path: &Path,
     ) -> Result<Vec<DownloadTask>, ModpackError> {
-        let mut tasks = Vec::new();
-
-        for file in &self.files {
-            let download_url = file
-                .downloads
-                .first()
-                .ok_or_else(|| ModpackError::Parse("missing download url".to_string()))?;
-            let dest = instance_path.join(&file.path);
-            let mut task = DownloadTask::new(download_url.clone(), dest);
-            task = task.with_sha1(file.hashes.sha1.clone());
-            tasks.push(task);
-        }
-
-        Ok(tasks)
+        Ok(self
+            .download_requests(instance_path)?
+            .into_iter()
+            .map(|request| {
+                let mut task = DownloadTask::new(request.src.to_string(), request.dest);
+                if let Some(sha1) = request.sha1 {
+                    task = task.with_sha1(sha1);
+                }
+                task
+            })
+            .collect())
     }
 
-    fn overrides_path(&self) -> &str {
-        "overrides"
+    fn overrides_path(&self) -> String {
+        "overrides".into()
     }
 }
 
+impl Default for ModrinthManifest {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            game: "minecraft".into(),
+            version_id: String::new(),
+            name: String::new(),
+            summary: None,
+            files: Vec::new(),
+            dependencies: HashMap::new(),
+        }
+    }
+}
+impl ModrinthManifest {
+    pub fn download_requests(
+        &self,
+        instance_path: &Path,
+    ) -> Result<Vec<crate::download::request::DownloadParam>, ModpackError> {
+        let mut requests = Vec::new();
+        for file in &self.files {
+            if file
+                .env
+                .as_ref()
+                .is_some_and(|env| env.client == "unsupported")
+            {
+                continue;
+            }
+            if file.path.is_empty()
+                || file.path.contains('\\')
+                || !Path::new(&file.path)
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(ModpackError::Parse("invalid modpack file path".into()));
+            }
+            let url = file
+                .downloads
+                .first()
+                .ok_or_else(|| ModpackError::Parse("missing download URL".into()))?;
+            requests.push(crate::download::request::DownloadParam {
+                src: url
+                    .parse()
+                    .map_err(|error: url::ParseError| ModpackError::Parse(error.to_string()))?,
+                dest: instance_path.join(&file.path),
+                filename: None,
+                sha1: Some(file.hashes.sha1.clone()),
+            });
+        }
+        Ok(requests)
+    }
+}
 /// Generates a Modrinth manifest from an instance for export.
 ///
 /// `selected_files` is a list of `(relative_path, absolute_path)` pairs.
@@ -129,57 +167,183 @@ pub async fn generate_manifest(
     mod_loader: Option<(ModLoaderType, String)>,
     selected_files: &[(String, PathBuf)],
 ) -> Result<ModrinthManifest, ModpackError> {
-    let mut dependencies = HashMap::new();
-    dependencies.insert("minecraft".to_string(), mc_version.to_string());
+    let options = ExportModpackOptions {
+        format: crate::modpack::export::ExportFormat::Modrinth,
+        name: options.name.clone(),
+        version: options.version_id.clone(),
+        description: options.summary.clone(),
+        author: None,
+        min_memory: None,
+        no_create_remote_files: Some(false),
+        skip_curseforge_remote_files: Some(true),
+    };
+    let (loader, version) = mod_loader.unwrap_or((ModLoaderType::Unknown, String::new()));
+    let mut manifest = generate_modrinth_manifest(mc_version, loader, &version, &options);
+    manifest.files =
+        collect_modrinth_files(&reqwest::Client::new(), None, selected_files, false, true)
+            .await?
+            .0;
+    Ok(manifest)
+}
 
-    if let Some((loader_type, version)) = mod_loader {
-        let key = match loader_type {
+use crate::modpack::export::{
+    ExportModpackOptions, ModpackExportBundle, normalize_mod_loader_version,
+};
+use crate::resource::{curseforge::CurseForgeClient, http::ResourceTransport};
+use sha1::Digest;
+pub async fn build_modrinth_export_bundle<C: ResourceTransport>(
+    client: &C,
+    curseforge_key: Option<&str>,
+    game_version: &str,
+    loader: ModLoaderType,
+    loader_version: &str,
+    options: &ExportModpackOptions,
+    selected_files: &[(String, PathBuf)],
+) -> Result<ModpackExportBundle, ModpackError> {
+    let mut manifest = generate_modrinth_manifest(game_version, loader, loader_version, options);
+    let no_create_remote_files = options.no_create_remote_files.unwrap_or(false);
+    let skip_curseforge = options.skip_curseforge_remote_files.unwrap_or(false);
+    let (modrinth_files, override_files) = collect_modrinth_files(
+        client,
+        curseforge_key,
+        selected_files,
+        no_create_remote_files,
+        skip_curseforge,
+    )
+    .await?;
+
+    manifest.files = modrinth_files;
+    let json = serde_json::to_string_pretty(&manifest)?;
+
+    Ok(ModpackExportBundle {
+        overrides_prefix: "overrides".to_string(),
+        overrides_files: override_files,
+        extra_files: vec![("modrinth.index.json".to_string(), json)],
+    })
+}
+
+fn generate_modrinth_manifest(
+    game_version: &str,
+    loader: ModLoaderType,
+    loader_version: &str,
+    options: &ExportModpackOptions,
+) -> ModrinthManifest {
+    let mut dependencies = HashMap::new();
+    dependencies.insert("minecraft".to_string(), game_version.to_owned());
+
+    if loader != ModLoaderType::Unknown {
+        let version = normalize_mod_loader_version(loader_version);
+        let loader_key = match loader {
             ModLoaderType::Forge | ModLoaderType::LegacyForge => "forge",
             ModLoaderType::Fabric => "fabric-loader",
             ModLoaderType::NeoForge => "neoforge",
             ModLoaderType::Quilt => "quilt-loader",
             _ => "",
         };
-        if !key.is_empty() {
-            dependencies.insert(key.to_string(), version);
+
+        if !loader_key.is_empty() {
+            dependencies.insert(loader_key.to_string(), version);
         }
     }
 
-    let mut files = Vec::new();
-    let client = ModrinthClient::new();
-
-    for (rel, full) in selected_files {
-        let is_remote_candidate = rel.starts_with("mods/")
-            || rel.starts_with("resourcepacks/")
-            || rel.starts_with("shaderpacks/");
-
-        if is_remote_candidate
-            && let Ok(hash) = crate::util::hash::sha1_file(full).await
-            && let Ok(version_info) = client.get_version_file(&hash, "sha1").await
-            && let Some(file_info) = version_info.files.iter().find(|f| f.hashes.sha1 == hash)
-        {
-            files.push(ModrinthManifestFile {
-                path: rel.clone(),
-                hashes: ModrinthFileHashes {
-                    sha1: hash,
-                    sha512: file_info.hashes.sha512.clone(),
-                },
-                env: None,
-                downloads: vec![file_info.url.clone()],
-                file_size: tokio::fs::metadata(full).await.map_or(0, |m| m.len()),
-            });
-        }
-    }
-
-    Ok(ModrinthManifest {
-        format_version: 1,
-        game: "minecraft".to_string(),
-        version_id: options.version_id.clone(),
+    ModrinthManifest {
+        version_id: options.version.clone(),
         name: options.name.clone(),
-        summary: options.summary.clone(),
-        files,
+        summary: options.description.clone(),
+        files: Vec::new(),
         dependencies,
-    })
+        ..Default::default()
+    }
+}
+
+async fn build_modrinth_remote_file<C: ResourceTransport>(
+    client: &C,
+    curseforge_key: Option<&str>,
+    rel: &str,
+    full: &Path,
+    skip_curseforge: bool,
+) -> Result<Option<ModrinthManifestFile>, ModpackError> {
+    let is_disabled = rel.ends_with(".disabled");
+    let manifest_path = if is_disabled {
+        rel.trim_end_matches(".disabled").to_string()
+    } else {
+        rel.to_string()
+    };
+
+    let mut downloads = Vec::new();
+
+    if let Ok(remote) = ModrinthClient::with_client(client)
+        .identify_file(full)
+        .await
+    {
+        downloads.push(remote.download_url);
+    }
+
+    if !skip_curseforge
+        && let Some(key) = curseforge_key
+        && let Ok(remote) = CurseForgeClient::with_client(client, key.to_owned())
+            .identify_file(full)
+            .await
+    {
+        downloads.push(remote.download_url);
+    }
+
+    if downloads.is_empty() {
+        return Ok(None);
+    }
+
+    let file_content = tokio::fs::read(full).await?;
+    let mut sha1_hasher = sha1::Sha1::new();
+    let mut sha512_hasher = sha2::Sha512::new();
+    sha1_hasher.update(&file_content);
+    sha512_hasher.update(&file_content);
+    let sha1 = hex::encode(sha1_hasher.finalize());
+    let sha512 = hex::encode(sha512_hasher.finalize());
+    let file_size = file_content.len() as u64;
+    let env = if is_disabled {
+        Some(ModrinthFileEnv {
+            client: "optional".to_string(),
+            server: "unsupported".to_string(),
+        })
+    } else {
+        None
+    };
+
+    Ok(Some(ModrinthManifestFile {
+        path: manifest_path,
+        hashes: ModrinthFileHashes { sha1, sha512 },
+        env,
+        downloads,
+        file_size,
+    }))
+}
+
+async fn collect_modrinth_files<C: ResourceTransport>(
+    client: &C,
+    curseforge_key: Option<&str>,
+    selected_files: &[(String, PathBuf)],
+    no_create_remote_files: bool,
+    skip_curseforge: bool,
+) -> Result<(Vec<ModrinthManifestFile>, Vec<(String, PathBuf)>), ModpackError> {
+    let mut remote = Vec::new();
+    let mut overrides = Vec::new();
+    for (relative, full) in selected_files {
+        let candidate = ["mods/", "resourcepacks/", "shaderpacks/"]
+            .iter()
+            .any(|prefix| relative.starts_with(prefix));
+        let file = if candidate && !no_create_remote_files {
+            build_modrinth_remote_file(client, curseforge_key, relative, full, skip_curseforge)
+                .await?
+        } else {
+            None
+        };
+        if let Some(file) = file {
+            remote.push(file);
+        } else {
+            overrides.push((relative.clone(), full.clone()));
+        }
+    }
+    Ok((remote, overrides))
 }
 
 #[cfg(test)]

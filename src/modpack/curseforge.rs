@@ -57,17 +57,7 @@ impl ModpackManifest for CurseForgeManifest {
     where
         Self: Sized,
     {
-        let file = std::fs::File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| ModpackError::Parse(format!("invalid zip: {e}")))?;
-        let mut manifest_file = archive
-            .by_name("manifest.json")
-            .map_err(|_| ModpackError::Parse("manifest.json not found".to_string()))?;
-        let mut content = String::new();
-        std::io::Read::read_to_string(&mut manifest_file, &mut content)
-            .map_err(|e| ModpackError::Io(e.to_string()))?;
-        let manifest: Self = serde_json::from_str(&content)?;
-        Ok(manifest)
+        crate::modpack::read_manifest(&std::fs::File::open(path)?, "manifest.json")
     }
 
     fn client_version(&self) -> Result<String, ModpackError> {
@@ -102,39 +92,64 @@ impl ModpackManifest for CurseForgeManifest {
             ModpackError::Api("MINECRAFTD_CURSEFORGE_API_KEY not set".to_string())
         })?;
 
-        let mut tasks = Vec::new();
-
-        for file_entry in &self.files {
-            let file_info = client
-                .get_file_info(file_entry.project_id, file_entry.file_id)
-                .await
-                .map_err(|e| ModpackError::Api(e.to_string()))?;
-
-            let download_url = file_info
-                .download_url
-                .clone()
-                .unwrap_or_else(|| fallback_download_url(file_info.id, &file_info.file_name));
-
-            let sha1 = file_info
-                .hashes
-                .iter()
-                .find(|h| h.algo == 1)
-                .map(|h| h.value.clone());
-
-            let dest = instance_path.join("mods").join(&file_info.file_name);
-
-            let mut task = DownloadTask::new(download_url, dest);
-            if let Some(expected) = sha1 {
-                task = task.with_sha1(expected);
-            }
-            tasks.push(task);
-        }
-
-        Ok(tasks)
+        Ok(self
+            .download_requests(&client, instance_path)
+            .await?
+            .into_iter()
+            .map(|request| {
+                let mut task = DownloadTask::new(request.src.to_string(), request.dest);
+                if let Some(sha1) = request.sha1 {
+                    task = task.with_sha1(sha1);
+                }
+                task
+            })
+            .collect())
     }
 
-    fn overrides_path(&self) -> &str {
-        &self.overrides
+    fn overrides_path(&self) -> String {
+        self.overrides.clone()
+    }
+}
+
+impl CurseForgeManifest {
+    pub async fn download_requests<C: crate::resource::http::ResourceTransport>(
+        &self,
+        client: &CurseForgeClient<C>,
+        instance: &Path,
+    ) -> Result<Vec<crate::download::request::DownloadParam>, ModpackError> {
+        let mut requests = Vec::new();
+        for entry in &self.files {
+            let project = client.get_mod(entry.project_id).await?;
+            let file = client
+                .get_file_info(entry.project_id, entry.file_id)
+                .await?;
+            let name = &file.file_name;
+            if name.is_empty() || name.contains(['/', '\\']) || matches!(name.as_str(), "." | "..")
+            {
+                return Err(ModpackError::Parse("invalid CurseForge filename".into()));
+            }
+            let directory = match project.class_id {
+                Some(12 | 6945) => "resourcepacks",
+                Some(6552) => "shaderpacks",
+                _ => "mods",
+            };
+            let url = file
+                .download_url
+                .unwrap_or_else(|| fallback_download_url(file.id, name));
+            requests.push(crate::download::request::DownloadParam {
+                src: url
+                    .parse()
+                    .map_err(|error: url::ParseError| ModpackError::Parse(error.to_string()))?,
+                dest: instance.join(directory).join(name),
+                filename: Some(name.clone()),
+                sha1: file
+                    .hashes
+                    .iter()
+                    .find(|hash| hash.algo == 1)
+                    .map(|hash| hash.value.clone()),
+            });
+        }
+        Ok(requests)
     }
 }
 

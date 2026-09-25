@@ -1,5 +1,7 @@
 pub mod curseforge;
+pub mod export;
 pub mod modrinth;
+pub mod multimc;
 
 use crate::download::task::DownloadTask;
 use crate::minecraft::loaders::ModLoaderType;
@@ -77,9 +79,20 @@ pub trait ModpackManifest: Send + Sync {
     -> Result<Vec<DownloadTask>, ModpackError>;
 
     /// Returns the overrides directory prefix inside the archive.
-    fn overrides_path(&self) -> &str;
+    fn overrides_path(&self) -> String;
 }
 
+pub fn read_manifest<T: serde::de::DeserializeOwned>(
+    file: &std::fs::File,
+    name: &str,
+) -> Result<T, ModpackError> {
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| ModpackError::Parse(error.to_string()))?;
+    let entry = archive
+        .by_name(name)
+        .map_err(|error| ModpackError::Parse(error.to_string()))?;
+    Ok(serde_json::from_reader(entry)?)
+}
 /// Detects the modpack format by inspecting the zip archive contents.
 ///
 /// # Errors
@@ -97,7 +110,7 @@ pub fn detect_format(path: &Path) -> Result<ModpackFormat, ModpackError> {
         if name == "modrinth.index.json" {
             return Ok(ModpackFormat::Modrinth);
         }
-        if name == "instance.cfg" {
+        if name == "mmc-pack.json" || name.ends_with("/mmc-pack.json") {
             return Ok(ModpackFormat::MultiMc);
         }
     }
@@ -115,7 +128,17 @@ pub fn extract_overrides(
     instance_path: &Path,
     overrides_prefix: &str,
 ) -> Result<(), ModpackError> {
-    let file = std::fs::File::open(archive_path)?;
+    extract_overrides_reader(
+        &std::fs::File::open(archive_path)?,
+        instance_path,
+        overrides_prefix,
+    )
+}
+pub fn extract_overrides_reader(
+    file: &std::fs::File,
+    instance_path: &Path,
+    overrides_prefix: &str,
+) -> Result<(), ModpackError> {
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| ModpackError::Parse(format!("invalid zip archive: {e}")))?;
 
@@ -125,7 +148,9 @@ pub fn extract_overrides(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ModpackError::Io(e.to_string()))?;
-        let path = entry.mangled_name();
+        let path = entry
+            .enclosed_name()
+            .ok_or_else(|| ModpackError::Parse("unsafe archive entry".into()))?;
 
         if let Ok(rel) = path.strip_prefix(&prefix) {
             let out = instance_path.join(rel);
@@ -143,104 +168,12 @@ pub fn extract_overrides(
     Ok(())
 }
 
-/// Blacklisted file/directory names for modpack export.
-///
-/// Mirrored from SJMCL's export blacklist.
-static EXPORT_BLACKLIST: &[&str] = &[
-    ".DS_Store",
-    "desktop.ini",
-    "Thumbs.db",
-    "usernamecache.json",
-    "usercache.json",
-    "jars",
-    "logs",
-    "versions",
-    "assets",
-    "libraries",
-    "crash-reports",
-    "NVIDIA",
-    "AMD",
-    "screenshots",
-    "natives",
-    "native",
-    "$native",
-    "$natives",
-    "server-resource-packs",
-    "command_history.txt",
-    "launcher_profiles.json",
-    "launcher.pack.lzma",
-    "launcher_accounts.json",
-    "launcher_cef_log.txt",
-    "launcher_log.txt",
-    "launcher_msa_credentials.bin",
-    "launcher_settings.json",
-    "launcher_ui_state.json",
-    "realms_persistence.json",
-    "webcache2",
-    "treatment_tags.json",
-    "clientId.txt",
-    "PCL.ini",
-    "backup",
-    "pack.json",
-    "launcher.jar",
-    "cache",
-    "modpack.cfg",
-    "log4j2.xml",
-    "hmclversion.cfg",
-    "install_profile.json",
-    "sjmclcfg.json",
-    "manifest.json",
-    "minecraftinstance.json",
-    ".curseclient",
-    "modrinth.index.json",
-    ".fabric",
-    ".mixin.out",
-    ".optifine",
-    "downloads",
-    "essential",
-    "asm",
-    "backups",
-    "TCNodeTracker",
-    "CustomDISkins",
-    "data",
-    "CustomSkinLoader/caches",
-    "debug",
-    ".replay_cache",
-    "replay_recordings",
-    "replay_videos",
-    "irisUpdateInfo.json",
-    "modernfix",
-    "modtranslations",
-    "schematics",
-    "journeymap/data",
-    "mods/.connector",
-];
-
-/// Collects candidate files for modpack export from an instance directory.
-///
-/// Filters out blacklisted directories and files.
 pub fn collect_export_files(instance_path: &Path) -> Result<Vec<PathBuf>, ModpackError> {
-    let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(instance_path)
+    Ok(export::list_files(instance_path, "")?
+        .all
         .into_iter()
-        .filter_entry(|e| {
-            let rel = e
-                .path()
-                .strip_prefix(instance_path)
-                .unwrap_or_else(|_| e.path());
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            !EXPORT_BLACKLIST.contains(&rel_str.as_str())
-                && !rel_str.ends_with(".log")
-                && !rel_str.contains("-natives")
-                && !rel_str.starts_with("._")
-        })
-    {
-        let entry = entry.map_err(|e| ModpackError::Io(e.to_string()))?;
-        if entry.file_type().is_file() {
-            files.push(entry.path().to_path_buf());
-        }
-    }
-    Ok(files)
+        .map(|path| instance_path.join(path))
+        .collect())
 }
 
 /// Creates a modpack zip archive from an export bundle.
