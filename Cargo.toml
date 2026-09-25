@@ -35,18 +35,22 @@ urlencoding = "2"
 sha1 = "0.11"
 hex = "0.4"
 zip = "8"
-dirs = "6"
+dirs = "7"
 semver = "1"
+regex = "1"
+cafebabe = "0.8.1"
 which = "8"
 toml = "1"
 md5 = "0.8"
+murmur2 = "0.1"
+quartz_nbt = { version = "0.2.9", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v7", "serde"] }
 walkdir = "2"
-url = "2"
+url = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
 ctrlc = "3"
@@ -58,3 +62,6 @@ nix = { version = "0.31", features = ["signal", "process", "user"] }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55.0"
