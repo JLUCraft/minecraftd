@@ -10,21 +10,6 @@ pub const DEFAULT_AUTO_MEMORY_MB: u32 = 2048;
 /// Default Minecraft client main class.
 pub const DEFAULT_MAIN_CLASS: &str = "net.minecraft.client.main.Main";
 
-/// Launch arguments for the Minecraft client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LaunchArguments {
-    /// JVM arguments (memory, GC, system properties).
-    pub jvm_args: Vec<String>,
-    /// Classpath entries.
-    pub class_paths: Vec<String>,
-    /// The main class to launch.
-    pub main_class: String,
-    /// Game arguments (username, version, etc.).
-    pub game_args: Vec<String>,
-    /// Environment variables to set.
-    pub env: HashMap<String, String>,
-}
-
 /// Result of generating launch arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchCommand {
@@ -71,68 +56,66 @@ pub fn generate_launch_command(
     username: &str,
     window: &WindowParams,
 ) -> Result<LaunchCommand, LaunchArgsError> {
-    let mut jvm_args = Vec::new();
-    let mut game_args = Vec::new();
-
-    // Memory
-    jvm_args.push(format!("-Xmx{}m", window.max_memory_mb));
-
-    // Classpath
+    use crate::minecraft::plan::{GameOptions, JvmOptions, LaunchArguments, LaunchPlan};
     let libraries_dir = InstanceSubdir::Libraries.resolve(game_dir);
-    let class_paths = ArgumentEngine::build_classpath(version_info, &libraries_dir, game_dir);
-    let class_paths_str: Vec<String> = class_paths
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
+    let class_paths = ArgumentEngine::build_classpath(version_info, &libraries_dir, game_dir)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
         .collect();
-
-    // Main class
+    let auth = AuthParams::new(username);
+    let replacements = build_replacement_map(version_info, game_dir, &auth, window);
+    let mut game_template = ArgumentEngine::resolve_game_args(version_info, &replacements);
+    if !window.fullscreen {
+        game_template.extend([
+            "--width".into(),
+            window.width.to_string(),
+            "--height".into(),
+            window.height.to_string(),
+        ]);
+    }
     let main_class = version_info
         .main_class
         .clone()
-        .unwrap_or_else(|| DEFAULT_MAIN_CLASS.to_string());
-
-    // Build replacement map using offline-mode auth
-    let auth = AuthParams::new(username);
-    let replacements = build_replacement_map(version_info, game_dir, &auth, window);
-
-    // Resolve arguments
-    jvm_args.extend(ArgumentEngine::resolve_jvm_args(
-        version_info,
-        &replacements,
-    ));
-    game_args.extend(ArgumentEngine::resolve_game_args(
-        version_info,
-        &replacements,
-    ));
-
-    // Window settings
-    if window.fullscreen {
-        game_args.push("--fullscreen".to_string());
-    } else {
-        game_args.push("--width".to_string());
-        game_args.push(window.width.to_string());
-        game_args.push("--height".to_string());
-        game_args.push(window.height.to_string());
+        .unwrap_or_else(|| DEFAULT_MAIN_CLASS.into());
+    let mut rendered = LaunchPlan {
+        class_paths,
+        parameters: LaunchArguments::default(),
+        custom_version_name: None,
+        main_class: main_class.clone(),
+        jvm_template: ArgumentEngine::resolve_jvm_args(version_info, &replacements),
+        game_template,
+        jvm: JvmOptions {
+            max_memory_mb: window.max_memory_mb,
+            ..Default::default()
+        },
+        game: GameOptions {
+            fullscreen: window.fullscreen,
+            legacy_server: window.auto_join_server.clone(),
+            ..Default::default()
+        },
     }
-
-    // Quick play / auto-join
-    if let Some(server) = &window.auto_join_server {
-        game_args.push("--server".to_string());
-        game_args.push(server.clone());
-    }
-
-    // Build the full command
-    let mut all_args = jvm_args.clone();
-    all_args.push("-cp".to_string());
-    all_args.push(class_paths_str.join(if cfg!(windows) { ";" } else { ":" }));
-    all_args.push(main_class);
-    all_args.extend(game_args.clone());
-
+    .render()
+    .map_err(|error| LaunchArgsError::InvalidVersionInfo(error.to_string()))?;
+    // Standalone callers receive an explicit classpath; desktop wrappers can use process_spec's environment.
+    let main = rendered
+        .args
+        .iter()
+        .position(|argument| argument == &main_class)
+        .ok_or_else(|| LaunchArgsError::MissingField("main class".into()))?;
+    rendered.args.splice(
+        main..main,
+        [
+            "-cp".into(),
+            rendered
+                .class_paths
+                .join(crate::minecraft::plan::get_separator()),
+        ],
+    );
     Ok(LaunchCommand {
-        java_exec: java_exec.to_string(),
-        args: all_args,
+        java_exec: java_exec.into(),
+        args: rendered.args,
         env: HashMap::new(),
-        work_dir: game_dir.to_path_buf(),
+        work_dir: game_dir.into(),
     })
 }
 
@@ -194,7 +177,7 @@ mod tests {
     fn test_generate_launch_command_legacy() {
         let version_info = VersionInfo {
             id: "1.12.2".into(),
-            version_type: "release".into(),
+            type_: "release".into(),
             asset_index: crate::minecraft::version::AssetIndex {
                 id: "legacy".into(),
                 ..Default::default()
@@ -238,18 +221,18 @@ mod tests {
     fn test_generate_launch_command_modern() {
         let version_info = VersionInfo {
             id: "1.20.4".into(),
-            version_type: "release".into(),
+            type_: "release".into(),
             asset_index: crate::minecraft::version::AssetIndex {
                 id: "12".into(),
                 ..Default::default()
             },
             arguments: Some(crate::minecraft::version::Arguments {
                 game: vec![
-                    crate::minecraft::version::ArgumentValue::String("--username".into()),
-                    crate::minecraft::version::ArgumentValue::String("Steve".into()),
+                    crate::minecraft::version::ArgumentValue::from("--username".to_owned()),
+                    crate::minecraft::version::ArgumentValue::from("Steve".to_owned()),
                 ],
-                jvm: vec![crate::minecraft::version::ArgumentValue::String(
-                    "-XX:+UseG1GC".into(),
+                jvm: vec![crate::minecraft::version::ArgumentValue::from(
+                    "-XX:+UseG1GC".to_owned(),
                 )],
             }),
             main_class: Some("net.minecraft.client.main.Main".into()),
@@ -289,7 +272,7 @@ mod tests {
     fn test_generate_launch_command_no_main_class() {
         let version_info = VersionInfo {
             id: "1.20.4".into(),
-            version_type: "release".into(),
+            type_: "release".into(),
             asset_index: crate::minecraft::version::AssetIndex {
                 id: "12".into(),
                 ..Default::default()
@@ -318,7 +301,7 @@ mod tests {
     fn test_generate_launch_command_no_auto_join() {
         let version_info = VersionInfo {
             id: "1.20.4".into(),
-            version_type: "release".into(),
+            type_: "release".into(),
             asset_index: crate::minecraft::version::AssetIndex {
                 id: "12".into(),
                 ..Default::default()

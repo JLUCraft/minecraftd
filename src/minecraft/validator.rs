@@ -93,9 +93,7 @@ pub async fn validate_libraries(
     let mut wrong_size = Vec::new();
 
     for lib in &version_info.libraries {
-        if let Some(rules) = &lib.rules
-            && !crate::minecraft::library::evaluate_rules(rules)
-        {
+        if !crate::minecraft::library::evaluate_rules(&lib.rules) {
             continue;
         }
         if let Some(downloads) = &lib.downloads
@@ -242,26 +240,28 @@ mod tests {
                     name: "com.mojang:authlib:4.0.43".into(),
                     downloads: Some(LibraryDownloads {
                         artifact: Some(DownloadInfo {
+                            path: String::new(),
                             sha1: "abc".into(),
                             size: 100,
                             url: "http://example.com/authlib.jar".into(),
                         }),
                         classifiers: None,
                     }),
-                    rules: None,
+                    rules: Vec::new(),
                     ..Default::default()
                 },
                 LibraryInfo {
                     name: "org.missing:lib:1.0.0".into(),
                     downloads: Some(LibraryDownloads {
                         artifact: Some(DownloadInfo {
+                            path: String::new(),
                             sha1: "def".into(),
                             size: 50,
                             url: "http://example.com/missing.jar".into(),
                         }),
                         classifiers: None,
                     }),
-                    rules: None,
+                    rules: Vec::new(),
                     ..Default::default()
                 },
             ],
@@ -285,20 +285,21 @@ mod tests {
                 name: "windows:only:1.0".into(),
                 downloads: Some(LibraryDownloads {
                     artifact: Some(DownloadInfo {
+                        path: String::new(),
                         sha1: "abc".into(),
                         size: 10,
                         url: "http://example.com/win.jar".into(),
                     }),
                     classifiers: None,
                 }),
-                rules: Some(vec![Rule {
+                rules: vec![Rule {
                     action: "allow".into(),
                     os: Some(OsCondition {
-                        name: Some("windows".into()),
+                        name: "windows".into(),
                         ..Default::default()
                     }),
                     features: None,
-                }]),
+                }],
                 ..Default::default()
             }],
             ..Default::default()
@@ -410,13 +411,14 @@ mod tests {
                 name: "com.mojang:authlib:4.0.43".into(),
                 downloads: Some(LibraryDownloads {
                     artifact: Some(DownloadInfo {
+                        path: String::new(),
                         sha1: "aabbccdd".into(),
                         size: 13,
                         url: "http://example.com/authlib.jar".into(),
                     }),
                     classifiers: None,
                 }),
-                rules: None,
+                rules: Vec::new(),
                 ..Default::default()
             }],
             ..Default::default()

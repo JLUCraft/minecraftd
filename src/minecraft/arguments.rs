@@ -1,7 +1,7 @@
 use crate::instance::path::InstanceSubdir;
 use crate::minecraft::library::evaluate_rules;
 use crate::minecraft::version::LibraryInfo;
-use crate::minecraft::version::{ArgumentObjectValue, ArgumentValue, VersionInfo};
+use crate::minecraft::version::{ArgumentValue, VersionInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ impl ArgumentEngine {
         let mut paths = Vec::new();
 
         for lib in &version_info.libraries {
-            if !lib.is_allowed() {
+            if !lib.allowed_for_current_platform() {
                 continue;
             }
             if lib.is_native() {
@@ -92,7 +92,7 @@ impl ArgumentEngine {
     ) -> Vec<(PathBuf, &'info LibraryInfo)> {
         let mut natives = Vec::new();
         for lib in &version_info.libraries {
-            if !lib.is_allowed() || !lib.is_native() {
+            if !lib.allowed_for_current_platform() || !lib.is_native() {
                 continue;
             }
             if let Some(path) = lib.native_path(libraries_dir) {
@@ -111,24 +111,12 @@ fn resolve_arguments(
     let mut result = Vec::new();
 
     for arg in args {
-        match arg {
-            ArgumentValue::String(s) => {
-                result.push(substitute(s, replacements));
-            }
-            ArgumentValue::Object(obj) => {
-                if evaluate_rules(&obj.rules) {
-                    match &obj.value {
-                        ArgumentObjectValue::String(s) => {
-                            result.push(substitute(s, replacements));
-                        }
-                        ArgumentObjectValue::Array(arr) => {
-                            for s in arr {
-                                result.push(substitute(s, replacements));
-                            }
-                        }
-                    }
-                }
-            }
+        if evaluate_rules(&arg.rules) {
+            result.extend(
+                arg.value
+                    .iter()
+                    .map(|value| substitute(value, replacements)),
+            );
         }
     }
 
@@ -183,10 +171,7 @@ pub fn build_replacement_map(
             .to_string_lossy()
             .to_string(),
     );
-    map.insert(
-        "${version_type}".to_string(),
-        version_info.version_type.clone(),
-    );
+    map.insert("${version_type}".to_string(), version_info.type_.clone());
 
     // Native path
     let natives_dir = ArgumentEngine::natives_dir(game_dir, &version_info.id);
@@ -216,7 +201,7 @@ pub fn build_replacement_map(
 mod tests {
     use super::*;
     use crate::minecraft::launch::{AuthParams, WindowParams};
-    use crate::minecraft::version::{ArgumentObject, DownloadInfo, LibraryDownloads, Rule};
+    use crate::minecraft::version::{DownloadInfo, LibraryDownloads, Rule};
 
     #[test]
     fn test_build_classpath_filters_natives() {
@@ -227,19 +212,21 @@ mod tests {
                     name: "org.lwjgl:lwjgl:3.3.2".into(),
                     downloads: Some(LibraryDownloads {
                         artifact: Some(DownloadInfo {
+                            path: String::new(),
                             sha1: "abc".into(),
                             size: 100,
                             url: "http://example.com/lwjgl.jar".into(),
                         }),
                         classifiers: None,
                     }),
-                    rules: None,
+                    rules: Vec::new(),
                     ..Default::default()
                 },
                 LibraryInfo {
                     name: "org.lwjgl:lwjgl:3.3.2".into(),
                     downloads: Some(LibraryDownloads {
                         artifact: Some(DownloadInfo {
+                            path: String::new(),
                             sha1: "abc".into(),
                             size: 100,
                             url: "http://example.com/lwjgl.jar".into(),
@@ -249,6 +236,7 @@ mod tests {
                             m.insert(
                                 crate::platform::native_classifier(),
                                 DownloadInfo {
+                                    path: String::new(),
                                     sha1: "def".into(),
                                     size: 50,
                                     url: "http://example.com/lwjgl-natives.jar".into(),
@@ -265,7 +253,7 @@ mod tests {
                         );
                         m
                     }),
-                    rules: None,
+                    rules: Vec::new(),
                     ..Default::default()
                 },
             ],
@@ -282,18 +270,18 @@ mod tests {
     #[test]
     fn test_resolve_arguments_with_rules() {
         let args = vec![
-            ArgumentValue::String("-Xmx2G".into()),
-            ArgumentValue::Object(ArgumentObject {
+            ArgumentValue::from("-Xmx2G".to_owned()),
+            ArgumentValue {
                 rules: vec![Rule {
                     action: "allow".into(),
                     os: Some(crate::minecraft::version::OsCondition {
-                        name: Some("windows".into()),
+                        name: "windows".into(),
                         ..Default::default()
                     }),
                     features: None,
                 }],
-                value: ArgumentObjectValue::String("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump".into()),
-            }),
+                value: vec!["-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump".into()],
+            },
         ];
 
         let replacements = HashMap::new();
@@ -329,7 +317,7 @@ mod tests {
     fn test_build_replacement_map() {
         let version_info = crate::minecraft::version::VersionInfo {
             id: "1.20.4".into(),
-            version_type: "release".into(),
+            type_: "release".into(),
             asset_index: crate::minecraft::version::AssetIndex {
                 id: "12".into(),
                 ..Default::default()

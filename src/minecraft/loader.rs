@@ -6,3 +6,9 @@ pub mod optifine;
 pub mod paper;
 pub mod plugin;
 pub mod quilt;
+
+pub mod libraries;
+
+pub mod processors;
+
+pub mod catalog;

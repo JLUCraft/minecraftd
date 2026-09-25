@@ -38,6 +38,31 @@ impl From<serde_json::Error> for LoaderInstallError {
     }
 }
 
+impl From<crate::minecraft::dependencies::DependencyError> for LoaderInstallError {
+    fn from(error: crate::minecraft::dependencies::DependencyError) -> Self {
+        Self::Parse(error.to_string())
+    }
+}
+impl From<url::ParseError> for LoaderInstallError {
+    fn from(error: url::ParseError) -> Self {
+        Self::Parse(error.to_string())
+    }
+}
+impl From<crate::resource::ResourceError> for LoaderInstallError {
+    fn from(error: crate::resource::ResourceError) -> Self {
+        Self::Network(error.to_string())
+    }
+}
+impl From<zip::result::ZipError> for LoaderInstallError {
+    fn from(error: zip::result::ZipError) -> Self {
+        Self::Parse(error.to_string())
+    }
+}
+impl From<std::num::ParseIntError> for LoaderInstallError {
+    fn from(error: std::num::ParseIntError) -> Self {
+        Self::Parse(error.to_string())
+    }
+}
 /// Finds a suitable Java executable for running installer jars.
 pub async fn find_java_executable() -> Result<std::path::PathBuf, LoaderInstallError> {
     // Try `java` from PATH first

@@ -10,6 +10,7 @@ pub enum ModLoaderType {
     Unknown,
     Fabric,
     Forge,
+    Cleanroom,
     LegacyForge,
     NeoForge,
     LiteLoader,
@@ -21,7 +22,10 @@ impl ModLoaderType {
     /// Returns true if this loader requires a separate installer.
     #[must_use]
     pub const fn requires_installer(&self) -> bool {
-        matches!(self, Self::Forge | Self::LegacyForge | Self::NeoForge)
+        matches!(
+            self,
+            Self::Forge | Self::LegacyForge | Self::NeoForge | Self::Cleanroom
+        )
     }
 
     /// Returns true if this loader is installed via library injection.
@@ -43,6 +47,7 @@ impl ModLoaderType {
             Self::Unknown => "Vanilla",
             Self::Fabric => "Fabric",
             Self::Forge => "Forge",
+            Self::Cleanroom => "Cleanroom",
             Self::LegacyForge => "Legacy Forge",
             Self::NeoForge => "NeoForge",
             Self::LiteLoader => "LiteLoader",
@@ -60,6 +65,7 @@ impl FromStr for ModLoaderType {
             "unknown" | "vanilla" => Ok(Self::Unknown),
             "fabric" => Ok(Self::Fabric),
             "forge" => Ok(Self::Forge),
+            "cleanroom" => Ok(Self::Cleanroom),
             "legacyforge" | "legacy_forge" => Ok(Self::LegacyForge),
             "neoforge" | "neo_forge" => Ok(Self::NeoForge),
             "liteloader" | "lite_loader" => Ok(Self::LiteLoader),
@@ -115,6 +121,12 @@ pub struct ModLoaderInfo {
     pub version: String,
     pub status: ModLoaderStatus,
     pub branch: Option<String>,
+}
+
+impl std::fmt::Display for ModLoaderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 #[cfg(test)]

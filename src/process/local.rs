@@ -40,53 +40,44 @@ impl LocalProcessHandle {
         output_callbacks: Arc<Mutex<Vec<ProcessOutputCallback>>>,
         exit_callbacks: Arc<Mutex<Vec<ProcessExitCallback>>>,
         exit_watch: watch::Receiver<Option<i32>>,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let running = Arc::new(AtomicBool::new(true));
 
         let output_cbs = output_callbacks.clone();
-        let out_running = running.clone();
-        tokio::spawn(async move {
+        let output_task = tokio::spawn(async move {
             let mut rx = output_rx;
-            while out_running.load(Ordering::SeqCst) {
-                match rx.recv().await {
-                    Some(data) => {
-                        if let Ok(cbs) = output_cbs.lock() {
-                            for cb in cbs.iter() {
-                                cb(&data);
-                            }
-                        }
+            while let Some(data) = rx.recv().await {
+                if let Ok(cbs) = output_cbs.lock() {
+                    for cb in cbs.iter() {
+                        cb(&data);
                     }
-                    None => break,
                 }
             }
         });
 
         let exit_cbs = exit_callbacks.clone();
-        let exit_running = running.clone();
         tokio::spawn(async move {
             let mut rx = exit_rx;
-            while exit_running.load(Ordering::SeqCst) {
-                match rx.recv().await {
-                    Some(code) => {
-                        if let Ok(cbs) = exit_cbs.lock() {
-                            for cb in cbs.iter() {
-                                cb(code);
-                            }
-                        }
+            while let Some(code) = rx.recv().await {
+                if let Ok(cbs) = exit_cbs.lock() {
+                    for cb in cbs.iter() {
+                        cb(code);
                     }
-                    None => break,
                 }
             }
         });
 
-        Self {
-            pid,
-            stdin: tokio::sync::Mutex::new(stdin),
-            running,
-            output_callbacks,
-            exit_callbacks,
-            exit_watch,
-        }
+        (
+            Self {
+                pid,
+                stdin: tokio::sync::Mutex::new(stdin),
+                running,
+                output_callbacks,
+                exit_callbacks,
+                exit_watch,
+            },
+            output_task,
+        )
     }
 
     /// Returns a receiver for watching process exit. None = still running, Some(code) = exited.
@@ -192,7 +183,7 @@ impl ProcessHandle for LocalProcessHandle {
                 Signal::Kill => NixSignal::SIGKILL,
                 Signal::Int => NixSignal::SIGINT,
             };
-            signal::kill(Pid::from_raw(self.pid as i32), nix_sig)
+            signal::killpg(Pid::from_raw(self.pid as i32), nix_sig)
                 .map_err(|e| ProcessError::KillFailed(e.to_string()))?;
         }
 
@@ -249,6 +240,16 @@ impl LocalSpawner {
 #[async_trait]
 impl crate::core::process::ProcessSpawner for LocalSpawner {
     async fn spawn(&self, spec: &ProcessSpec) -> Result<Box<dyn ProcessHandle>, SpawnError> {
+        self.spawn_with_output(spec, None).await
+    }
+}
+impl LocalSpawner {
+    /// Install the output consumer before starting readers, including for short-lived children.
+    pub async fn spawn_with_output(
+        &self,
+        spec: &ProcessSpec,
+        output: Option<ProcessOutputCallback>,
+    ) -> Result<Box<dyn ProcessHandle>, SpawnError> {
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
             .stdout(Stdio::piped())
@@ -265,6 +266,11 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
             cmd.env(key, value);
         }
 
+        // Keep wrappers and their JVM descendants in an owned group.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
         let mut child = cmd.spawn()?;
         let pid = child
             .id()
@@ -287,12 +293,12 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
         let (exit_tx, exit_rx) = mpsc::unbounded_channel::<i32>();
 
         let output_callbacks: Arc<Mutex<Vec<ProcessOutputCallback>>> =
-            Arc::new(Mutex::new(Vec::new()));
+            Arc::new(Mutex::new(output.into_iter().collect()));
         let exit_callbacks: Arc<Mutex<Vec<ProcessExitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
         let (exit_watch_tx, exit_watch_rx) = watch::channel(None);
 
-        let handle = LocalProcessHandle::new(
+        let (handle, output_task) = LocalProcessHandle::new(
             pid,
             stdin,
             output_rx,
@@ -314,6 +320,16 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
                     -1
                 }
             };
+            // A wrapper can exit before its JVM; release the whole owned group.
+            #[cfg(unix)]
+            if let Err(error) = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            ) && error != nix::errno::Errno::ESRCH
+            {
+                tracing::warn!(%error, "process group cleanup failed");
+            }
+            let _ = output_task.await;
             running.store(false, Ordering::SeqCst);
             let _ = exit_tx2.send(exit_code);
             let _ = exit_watch_tx.send(Some(exit_code));
@@ -462,5 +478,70 @@ mod tests {
         };
         let result = spawner.spawn(&spec).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_wrapper_descendant_stops(kill_wrapper: bool) {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 60 & echo $! > child.pid; read line".into(),
+            ],
+            cwd: Some(directory.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handle = LocalSpawner::new().spawn(&spec).await.unwrap();
+        let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) =
+                    tokio::fs::read_to_string(directory.path().join("child.pid")).await
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if kill_wrapper {
+            handle.kill(Signal::Kill).await.unwrap();
+        } else {
+            handle.write(b"exit\n").await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = tokio::fs::read_to_string(format!("/proc/{child_pid}/stat")).await;
+                // Orphaned zombies are already dead and await reaping by the host init.
+                let stopped = match status {
+                    Ok(status) => status
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z')),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+                if stopped && !handle.is_running() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn killing_wrapper_stops_descendants() {
+        assert_wrapper_descendant_stops(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exiting_wrapper_stops_descendants() {
+        assert_wrapper_descendant_stops(false).await;
     }
 }

@@ -1,3 +1,5 @@
+pub mod discovery;
+pub mod runtime;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -40,20 +42,18 @@ impl JavaSelector {
     /// * `required_major` - The required Java major version (e.g., 17, 21).
     #[must_use]
     pub fn select(&self, preferred: Option<&str>, required_major: i32) -> Option<&JavaRuntime> {
-        // If a preferred runtime is specified and matches, use it
-        if let Some(pref) = preferred
-            && let Some(runtime) = self.runtimes.iter().find(|r| {
-                r.exec_path.to_string_lossy() == pref && r.major_version >= required_major
-            })
-        {
-            return Some(runtime);
-        }
-
-        // Find the runtime with the minimum major version that satisfies the requirement
-        self.runtimes
+        let paths: Vec<String> = self
+            .runtimes
             .iter()
-            .filter(|r| r.major_version >= required_major)
-            .min_by_key(|r| r.major_version)
+            .map(|runtime| runtime.exec_path.to_string_lossy().into_owned())
+            .collect();
+        let candidates: Vec<(&str, i32)> = paths
+            .iter()
+            .zip(&self.runtimes)
+            .map(|(path, runtime)| (path.as_str(), runtime.major_version))
+            .collect();
+        select_runtime_index(&candidates, preferred, required_major)
+            .map(|index| &self.runtimes[index])
     }
 
     /// Adds a runtime to the selector.
@@ -72,6 +72,53 @@ impl Default for JavaSelector {
     fn default() -> Self {
         Self::new(Vec::new())
     }
+}
+
+/// Minimum requirements ordered newest first; manifest chronology handles snapshot names.
+pub const JAVA_THRESHOLDS: &[(&str, i32)] = &[
+    ("26.1-snapshot-1", 25),
+    ("24w14a", 21),
+    ("1.18-pre2", 17),
+    ("21w19a", 16),
+    ("17w13a", 8),
+];
+#[must_use]
+pub fn loader_java_requirement(
+    loader: crate::minecraft::loaders::ModLoaderType,
+    version: &str,
+) -> i32 {
+    if loader != crate::minecraft::loaders::ModLoaderType::Cleanroom {
+        return 0;
+    }
+    let threshold = semver::Version {
+        major: 0,
+        minor: 5,
+        patch: 0,
+        pre: semver::Prerelease::new("alpha").unwrap_or_default(),
+        build: semver::BuildMetadata::EMPTY,
+    };
+    if semver::Version::parse(version).is_ok_and(|version| version < threshold) {
+        21
+    } else {
+        25
+    }
+}
+/// Returns the selected entry's index, preserving order for equal Java versions.
+#[must_use]
+pub fn select_runtime_index(
+    runtimes: &[(&str, i32)],
+    preferred: Option<&str>,
+    required: i32,
+) -> Option<usize> {
+    if let Some(preferred) = preferred {
+        return runtimes.iter().position(|(path, _)| *path == preferred);
+    }
+    runtimes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, major))| *major >= required)
+        .min_by_key(|(_, (_, major))| *major)
+        .map(|(index, _)| index)
 }
 
 #[cfg(test)]

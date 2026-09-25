@@ -103,25 +103,14 @@ where
         self.config.get_mut()
     }
 
-    fn build_launch_spec(&self) -> ProcessSpec {
+    fn build_launch_spec(&self) -> Result<ProcessSpec, InstanceError> {
+        use crate::minecraft::plan::{GameOptions, JvmOptions, LaunchArguments, LaunchPlan};
         let cfg = self.config.get();
         let java = if cfg.java.exec_path.is_empty() {
-            "java".to_string()
+            "java"
         } else {
-            cfg.java.exec_path.clone()
+            &cfg.java.exec_path
         };
-
-        let mut args = Vec::new();
-
-        // Memory
-        let max_mem = if cfg.performance.auto_memory {
-            crate::minecraft::launch::DEFAULT_AUTO_MEMORY_MB
-        } else {
-            cfg.performance.max_memory_mb
-        };
-        args.push(format!("-Xmx{max_mem}m"));
-
-        // JVM isolation: dedicated tmpdir per instance
         let work_dir = if cfg.version_isolation {
             self.core.path.root.clone()
         } else {
@@ -133,36 +122,39 @@ where
                 .to_path_buf()
         };
         let tmpdir = self.core.path.subdir(InstanceSubdir::Tmp);
-        args.push(format!("-Djava.io.tmpdir={}", tmpdir.display()));
-
-        // JVM args
-        args.extend(cfg.jvm_args.clone());
-
-        // Main class
-        args.push(crate::minecraft::launch::DEFAULT_MAIN_CLASS.to_string());
-
-        // Game args
-        if cfg.window.fullscreen {
-            args.push("--fullscreen".to_string());
+        let mut jvm_template = vec![format!("-Djava.io.tmpdir={}", tmpdir.display())];
+        jvm_template.extend(cfg.jvm_args.clone());
+        let command = LaunchPlan {
+            class_paths: Vec::new(),
+            parameters: LaunchArguments::default(),
+            custom_version_name: None,
+            main_class: crate::minecraft::launch::DEFAULT_MAIN_CLASS.into(),
+            jvm_template,
+            game_template: cfg.game_args.clone(),
+            jvm: JvmOptions {
+                max_memory_mb: if cfg.performance.auto_memory {
+                    crate::minecraft::launch::DEFAULT_AUTO_MEMORY_MB
+                } else {
+                    cfg.performance.max_memory_mb
+                },
+                java_major: cfg.java.major_version,
+                ..Default::default()
+            },
+            game: GameOptions {
+                fullscreen: cfg.window.fullscreen,
+                legacy_server: cfg.auto_join_server.clone(),
+                ..Default::default()
+            },
         }
-        if let Some(server) = &cfg.auto_join_server {
-            args.push("--server".to_string());
-            args.push(server.clone());
-        }
-        args.extend(cfg.game_args.clone());
-
-        let mut env = std::collections::HashMap::new();
-        env.insert("TMPDIR".into(), tmpdir.to_string_lossy().into());
-        env.insert("TEMP".into(), tmpdir.to_string_lossy().into());
-        env.insert("TMP".into(), tmpdir.to_string_lossy().into());
-
-        ProcessSpec {
-            command: java,
-            args,
-            cwd: Some(work_dir),
-            env,
-            inherit_env: true,
-        }
+        .render()
+        .map_err(|error| InstanceError::Config(error.to_string()))?;
+        let environment = ["TMPDIR", "TEMP", "TMP"]
+            .into_iter()
+            .map(|key| (key.into(), tmpdir.to_string_lossy().into_owned()))
+            .collect();
+        command
+            .process_spec(java, work_dir, environment, "")
+            .map_err(|error| InstanceError::Config(error.to_string()))
     }
 }
 
@@ -206,8 +198,8 @@ where
         let id = self.core.id.clone();
         self.core.lifecycle.run_start_hooks(&id).await;
 
-        let spec = self.build_launch_spec();
-        debug!("launching client with spec: {:?}", spec);
+        let spec = self.build_launch_spec()?;
+        debug!("launching client {}", id);
 
         let handle = self.core.spawn_process(&spec).await?;
 
@@ -360,7 +352,7 @@ mod tests {
             },
         );
 
-        let spec = client.build_launch_spec();
+        let spec = client.build_launch_spec().unwrap();
         assert_eq!(spec.command, "/usr/bin/java");
         assert!(spec.args.contains(&"-Xmx4096m".to_string()));
         assert!(spec.args.contains(&"-XX:+UseG1GC".to_string()));
@@ -394,7 +386,7 @@ mod tests {
             },
         );
 
-        let spec = client.build_launch_spec();
+        let spec = client.build_launch_spec().unwrap();
         assert!(spec.args.contains(&"-Xmx2048m".to_string()));
     }
 

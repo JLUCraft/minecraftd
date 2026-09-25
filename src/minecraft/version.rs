@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Metadata about a Minecraft version.
 ///
@@ -39,159 +38,13 @@ pub struct LatestVersions {
     pub snapshot: String,
 }
 
-/// Detailed version information from a version JSON file.
-///
-/// This is the parsed form of Mojang's `version.json` files.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct VersionInfo {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub version_type: String,
-    #[serde(rename = "assetIndex", default)]
-    pub asset_index: AssetIndex,
-    #[serde(default)]
-    pub assets: String,
-    #[serde(rename = "complianceLevel")]
-    pub compliance_level: Option<u32>,
-    #[serde(default)]
-    pub downloads: HashMap<String, DownloadInfo>,
-    pub java_version: Option<JavaVersionRequirement>,
-    #[serde(default)]
-    pub libraries: Vec<LibraryInfo>,
-    #[serde(rename = "mainClass")]
-    pub main_class: Option<String>,
-    #[serde(rename = "minecraftArguments")]
-    pub minecraft_arguments: Option<String>,
-    pub arguments: Option<Arguments>,
-    #[serde(rename = "releaseTime", default)]
-    pub release_time: String,
-    #[serde(default)]
-    pub time: String,
-    /// Parent version ID for inheritance chains (e.g., Forge patches Vanilla).
-    #[serde(rename = "inheritsFrom", skip_serializing_if = "Option::is_none")]
-    pub inherits_from: Option<String>,
-    /// Logging configuration (client only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logging: Option<HashMap<String, LoggingConfig>>,
-    /// Minimum launcher version required.
-    #[serde(
-        rename = "minimumLauncherVersion",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub minimum_launcher_version: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AssetIndex {
-    pub id: String,
-    pub sha1: String,
-    pub size: u64,
-    #[serde(rename = "totalSize")]
-    pub total_size: u64,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct DownloadInfo {
-    pub sha1: String,
-    pub size: u64,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct JavaVersionRequirement {
-    pub component: String,
-    pub major_version: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LibraryInfo {
-    pub downloads: Option<LibraryDownloads>,
-    pub name: String,
-    pub rules: Option<Vec<Rule>>,
-    pub natives: Option<HashMap<String, String>>,
-    pub extract: Option<ExtractRules>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LibraryDownloads {
-    pub artifact: Option<DownloadInfo>,
-    pub classifiers: Option<HashMap<String, DownloadInfo>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Rule {
-    pub action: String,
-    pub os: Option<OsCondition>,
-    pub features: Option<HashMap<String, bool>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct OsCondition {
-    pub name: Option<String>,
-    pub version: Option<String>,
-    pub arch: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ExtractRules {
-    pub exclude: Vec<String>,
-}
-
-/// Logging configuration for a version.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LoggingConfig {
-    pub argument: String,
-    pub file: LoggingFile,
-    #[serde(rename = "type")]
-    pub log_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LoggingFile {
-    pub id: String,
-    pub sha1: String,
-    pub size: u64,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Arguments {
-    pub game: Vec<ArgumentValue>,
-    pub jvm: Vec<ArgumentValue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum ArgumentValue {
-    String(String),
-    Object(ArgumentObject),
-}
-
-impl Default for ArgumentValue {
-    fn default() -> Self {
-        Self::String(String::new())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ArgumentObject {
-    pub rules: Vec<Rule>,
-    pub value: ArgumentObjectValue,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum ArgumentObjectValue {
-    String(String),
-    Array(Vec<String>),
-}
-
-impl Default for ArgumentObjectValue {
-    fn default() -> Self {
-        Self::String(String::new())
-    }
-}
+pub use crate::minecraft::profile::{
+    ArgumentsItem as ArgumentValue, AssetIndexInfo as AssetIndex,
+    DownloadsArtifact as DownloadInfo, InstructionRule as Rule,
+    JavaVersion as JavaVersionRequirement, LaunchArgumentTemplate as Arguments,
+    LibrariesDownloads as LibraryDownloads, LibrariesExtract as ExtractRules,
+    LibrariesValue as LibraryInfo, McClientInfo as VersionInfo, OsInfo as OsCondition,
+};
 
 /// Compares two Minecraft version strings.
 ///
@@ -317,7 +170,7 @@ fn merge_version_info(child: &mut VersionInfo, parent: VersionInfo) {
     if child.minecraft_arguments.is_none() {
         child.minecraft_arguments = parent.minecraft_arguments;
     }
-    if child.logging.is_none() {
+    if child.logging.client.argument.is_empty() {
         child.logging = parent.logging;
     }
 }
@@ -365,12 +218,6 @@ mod tests {
     #[test]
     fn test_argument_value_default() {
         let av = ArgumentValue::default();
-        assert!(matches!(av, ArgumentValue::String(s) if s.is_empty()));
-    }
-
-    #[test]
-    fn test_argument_object_value_default() {
-        let av = ArgumentObjectValue::default();
-        assert!(matches!(av, ArgumentObjectValue::String(s) if s.is_empty()));
+        assert!(av.value.is_empty());
     }
 }

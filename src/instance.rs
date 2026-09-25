@@ -4,3 +4,5 @@ pub mod client;
 pub(crate) mod metadata;
 pub mod path;
 pub mod server;
+
+pub mod directory;

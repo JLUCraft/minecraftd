@@ -138,6 +138,55 @@ impl From<serde_json::Error> for VersionManifestError {
     }
 }
 
+use serde::{Deserialize, Serialize};
+// game client itself
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GameClientResourceInfo {
+    pub id: String,
+    pub game_type: String,
+    pub release_time: String,
+    pub url: String,
+}
+
+pub async fn fetch_with<C: crate::resource::http::ResourceTransport>(
+    client: &C,
+    sources: &[crate::resource::SourceType],
+) -> Result<VersionManifest, crate::resource::ResourceError> {
+    let mut error =
+        crate::resource::ResourceError::Network("no version manifest source configured".into());
+    for source in sources {
+        let url = crate::resource::get_download_api(
+            *source,
+            crate::resource::ResourceType::VersionManifest,
+        )?;
+        match client
+            .request_json(url.as_str(), &std::collections::HashMap::new(), None, None)
+            .await
+        {
+            Ok(value) => return Ok(serde_json::from_value(value)?),
+            Err(cause) => error = cause,
+        }
+    }
+    Err(error)
+}
+impl From<VersionMeta> for GameClientResourceInfo {
+    fn from(info: VersionMeta) -> Self {
+        let april_fool =
+            info.release_time.contains("04-01") && semver::Version::parse(&info.id).is_err();
+        Self {
+            id: info.id,
+            game_type: if april_fool {
+                "april_fools".to_owned()
+            } else {
+                info.version_type
+            },
+            release_time: info.release_time,
+            url: info.url,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -92,15 +92,12 @@ impl AddonInstaller {
 
         // If it's a mod, try to parse metadata
         if addon_type == AddonType::Mod {
-            match crate::minecraft::metainfo::parse_mod_metadata(&dest_path).await {
-                Ok(Some(meta)) => {
+            match crate::minecraft::metadata::get_mod_info_from_jar(&dest_path, None).await {
+                Ok(meta) => {
                     info!(
-                        "parsed mod metadata: {} v{} ({}",
-                        meta.name, meta.version, meta.mod_loader
+                        "parsed mod metadata: {} v{} ({:?})",
+                        meta.name, meta.version, meta.loader_type
                     );
-                }
-                Ok(None) => {
-                    debug!("no mod metadata found in {}", dest_path.display());
                 }
                 Err(e) => {
                     warn!("failed to parse mod metadata: {}", e);

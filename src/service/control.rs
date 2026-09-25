@@ -3,6 +3,11 @@ use tokio::sync::oneshot;
 /// Control messages sent to the instance supervisor.
 #[derive(Debug)]
 pub enum ControlMsg {
+    /// Execute an action and report its actual outcome, not merely queue admission.
+    Acknowledged {
+        command: Box<Self>,
+        reply: oneshot::Sender<Result<(), crate::instance::base::InstanceError>>,
+    },
     /// Request to start the instance.
     Start,
     /// Request to stop the instance gracefully.

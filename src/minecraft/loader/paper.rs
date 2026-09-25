@@ -304,7 +304,7 @@ impl PaperInstaller {
     fn synthetic_version_info(&self, mc_version: &str, build: &str) -> VersionInfo {
         VersionInfo {
             id: format!("{}-{}-{}", self.platform.project_name(), mc_version, build),
-            version_type: "release".to_string(),
+            type_: "release".to_string(),
             main_class: None, // Server JARs use `java -jar`, not a main class
             libraries: vec![],
             // Mark as server-only by setting a known field

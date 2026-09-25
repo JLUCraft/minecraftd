@@ -89,49 +89,51 @@ impl<I: Instance + Debug> Supervisor<I> {
                 biased;
 
                 // Process control messages
-                Some(msg) = self.control_rx.recv() => {
-                    match msg {
-                        ControlMsg::Start => {
-                            if let Err(e) = self.handle_start(&mut exit_watch).await {
-                                warn!("start failed: {}", e);
-                            }
+                msg = self.control_rx.recv() => {
+                    let Some(msg) = msg else {
+                        if let Err(error) = self.handle_stop().await {
+                            warn!("stop after owner release failed: {}", error);
                         }
+                        break;
+                    };
+                    let (msg, reply) = match msg {
+                        ControlMsg::Acknowledged { command, reply } => (*command, Some(reply)),
+                        msg => (msg, None),
+                    };
+                    let shutdown = matches!(msg, ControlMsg::Shutdown);
+                    let result = match msg {
+                        ControlMsg::Start => self.handle_start(&mut exit_watch).await,
                         ControlMsg::Stop => {
-                            if let Err(e) = self.handle_stop().await {
-                                warn!("stop failed: {}", e);
-                            }
-                            exit_watch = None;
+                            let result = self.handle_stop().await;
+                            if result.is_ok() { exit_watch = None; }
+                            result
                         }
                         ControlMsg::Kill => {
-                            if let Err(e) = self.handle_kill().await {
-                                warn!("kill failed: {}", e);
-                            }
-                            exit_watch = None;
+                            let result = self.handle_kill().await;
+                            if result.is_ok() { exit_watch = None; }
+                            result
                         }
-                        ControlMsg::Restart => {
-                            if let Err(e) = self.handle_restart(&mut exit_watch).await {
-                                warn!("restart failed: {}", e);
-                            }
-                        }
-                        ControlMsg::SendCommand(cmd) => {
-                            if let Err(e) = self.handle_send_command(&cmd).await {
-                                warn!("send_command failed: {}", e);
-                            }
-                        }
+                        ControlMsg::Restart => self.handle_restart(&mut exit_watch).await,
+                        ControlMsg::SendCommand(cmd) => self.handle_send_command(&cmd).await,
                         ControlMsg::GetPlayTime(tx) => {
-                            let secs = self.instance.lock().await.play_time_secs();
-                            let _ = tx.send(secs);
+                            let _ = tx.send(self.instance.lock().await.play_time_secs());
+                            Ok(())
                         }
                         ControlMsg::GetRecentOutput { n, tx } => {
-                            let lines = self.instance.lock().await.recent_output(n);
-                            let _ = tx.send(lines);
+                            let _ = tx.send(self.instance.lock().await.recent_output(n));
+                            Ok(())
                         }
-                        ControlMsg::Shutdown => {
-                            info!("supervisor shutting down");
-                            let _ = self.handle_stop().await;
-                            break;
-                        }
+                        ControlMsg::Shutdown => self.handle_stop().await,
+                        ControlMsg::Acknowledged { .. } => Err(InstanceError::Config("nested acknowledgement".into())),
+                    };
+                    // Publish before acknowledging so callers observe the completed operation.
+                    let _ = self.shared_state.send(self.instance.lock().await.state());
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    } else if let Err(error) = result {
+                        warn!("instance control failed: {}", error);
                     }
+                    if shutdown { break; }
                 }
 
                 // Watch for process exit

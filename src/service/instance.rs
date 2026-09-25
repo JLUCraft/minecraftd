@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, watch};
 /// A container-like service that wraps an instance and provides
 /// continuous monitoring, auto-restart, and external control.
 ///
-/// All operations are async and non-blocking. The actual work is done
-/// by a background supervisor task.
+/// Operations await a supervisor acknowledgement of the actual result.
+/// The supervisor performs the work asynchronously; dropping the owner stops it.
 #[derive(Debug)]
 pub struct InstanceService {
     control_tx: mpsc::Sender<ControlMsg>,
@@ -141,10 +141,18 @@ impl InstanceService {
     }
 
     async fn send_control(&self, msg: ControlMsg) -> Result<(), InstanceServiceError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
         self.control_tx
-            .send(msg)
+            .send(ControlMsg::Acknowledged {
+                command: Box::new(msg),
+                reply,
+            })
             .await
-            .map_err(|_| InstanceServiceError::SupervisorShutdown)
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)?;
+        received
+            .await
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)?
+            .map_err(InstanceServiceError::from)
     }
 }
 
@@ -171,6 +179,55 @@ mod tests {
     use crate::instance::path::InstancePath;
     use crate::instance::server::ServerConfig;
     use crate::process::local::LocalSpawner;
+
+    #[tokio::test]
+    async fn start_reports_process_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let service = InstanceService::new(
+            InstanceBuilder::new("failed-start".to_string(), InstancePath::new("."))
+                .spawner(LocalSpawner::new())
+                .event_bus(TokioBroadcastBus::new())
+                .build_server(ServerConfig {
+                    start_command: "/nonexistent/room-server".into(),
+                    ..Default::default()
+                }),
+            RestartPolicy::never(),
+        );
+        assert!(service.start().await.is_err());
+        service.shutdown().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_service_stops_supervisor_and_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = InstanceService::new(
+            InstanceBuilder::new("owner-release".to_string(), InstancePath::new("."))
+                .spawner(LocalSpawner::new())
+                .event_bus(TokioBroadcastBus::new())
+                .build_server(ServerConfig {
+                    start_command: "sh -c 'exec sleep 60'".into(),
+                    stop_command: "^C".into(),
+                    ..Default::default()
+                }),
+            RestartPolicy::never(),
+        );
+        let mut state = service.state_watch();
+        service.start().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *state.borrow() != InstanceState::Running {
+                state.changed().await?;
+            }
+            Ok::<_, tokio::sync::watch::error::RecvError>(())
+        })
+        .await??;
+        drop(service);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while state.changed().await.is_ok() {}
+        })
+        .await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_service_lifecycle() {

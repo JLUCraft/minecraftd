@@ -1,5 +1,6 @@
 use crate::minecraft::version::{LibraryInfo, Rule};
-use crate::platform::{current_arch, current_os_name};
+#[cfg(test)]
+use crate::platform::current_os_name;
 use std::path::{Path, PathBuf};
 
 impl LibraryInfo {
@@ -14,35 +15,16 @@ impl LibraryInfo {
     /// E.g., "natives-osx-arm64", "natives-linux", "natives-windows-x86_64"
     #[must_use]
     pub fn native_classifier(&self) -> Option<String> {
-        let natives = self.natives.as_ref()?;
-        let os_key = if cfg!(target_os = "windows") {
-            "windows"
-        } else if cfg!(target_os = "macos") {
-            "osx"
-        } else {
-            "linux"
-        };
-
-        let base = natives.get(os_key)?.clone();
-
-        // Substitute ${arch} placeholder
-        let arch = if cfg!(target_arch = "x86_64") {
-            "64"
-        } else if cfg!(target_arch = "x86") {
-            "32"
-        } else {
-            ""
-        };
-
-        Some(base.replace("${{arch}}", arch))
+        crate::minecraft::dependencies::native_classifier(
+            self.natives.as_ref()?,
+            &Default::default(),
+        )
     }
 
     /// Returns true if this library should be included for the current platform.
     #[must_use]
-    pub fn is_allowed(&self) -> bool {
-        self.rules
-            .as_ref()
-            .is_none_or(|rules| evaluate_rules(rules))
+    pub fn allowed_for_current_platform(&self) -> bool {
+        evaluate_rules(&self.rules)
     }
 
     /// Returns the local path where this library should be stored.
@@ -59,19 +41,9 @@ impl LibraryInfo {
         let classifiers = downloads.classifiers.as_ref()?;
         let _artifact = classifiers.get(&classifier)?;
 
-        // Native artifacts use the classifier in the path
-        let parts: Vec<&str> = self.name.split(':').collect();
-        if parts.len() < 3 {
-            return None;
-        }
-
-        let group = parts[0].replace('.', "/");
-        let artifact_name = parts[1];
-        let version = parts[2];
-
-        Some(libraries_dir.join(format!(
-            "{group}/{artifact_name}/{version}/{artifact_name}-{version}-{classifier}.jar"
-        )))
+        crate::minecraft::dependencies::convert_library_name_to_path(&self.name, Some(classifier))
+            .ok()
+            .map(|path| libraries_dir.join(path))
     }
 
     /// Returns the `DownloadInfo` for the main artifact.
@@ -95,33 +67,7 @@ impl LibraryInfo {
 /// Evaluates a list of rules to determine if a library/argument is allowed.
 #[must_use]
 pub fn evaluate_rules(rules: &[Rule]) -> bool {
-    let mut allowed = false;
-
-    for rule in rules {
-        let applies = rule.os.as_ref().is_none_or(check_os_condition);
-
-        if applies {
-            allowed = rule.action == "allow";
-        }
-    }
-
-    allowed
-}
-
-fn check_os_condition(os: &crate::minecraft::version::OsCondition) -> bool {
-    if let Some(name) = &os.name
-        && name != current_os_name()
-    {
-        return false;
-    }
-
-    if let Some(arch) = &os.arch
-        && arch != current_arch()
-    {
-        return false;
-    }
-
-    true
+    crate::minecraft::profile::rules_is_allowed(rules, &Default::default()).unwrap_or(false)
 }
 
 /// Converts a Maven-style library name to a path.
@@ -129,18 +75,8 @@ fn check_os_condition(os: &crate::minecraft::version::OsCondition) -> bool {
 /// E.g., "org.lwjgl:lwjgl:3.3.2" → "org/lwjgl/lwjgl/3.3.2/lwjgl-3.3.2.jar"
 #[must_use]
 pub fn artifact_path(name: &str) -> PathBuf {
-    let parts: Vec<&str> = name.split(':').collect();
-    if parts.len() < 3 {
-        return PathBuf::from(name);
-    }
-
-    let group = parts[0].replace('.', "/");
-    let artifact = parts[1];
-    let version = parts[2];
-
-    PathBuf::from(format!(
-        "{group}/{artifact}/{version}/{artifact}-{version}.jar"
-    ))
+    crate::minecraft::dependencies::convert_library_name_to_path(name, None)
+        .map_or_else(|_| PathBuf::from(name), PathBuf::from)
 }
 
 #[cfg(test)]
@@ -166,28 +102,28 @@ mod tests {
     fn test_library_is_allowed_no_rules() {
         let lib = LibraryInfo {
             name: "test:lib:1.0".into(),
-            rules: None,
+            rules: Vec::new(),
             ..Default::default()
         };
-        assert!(lib.is_allowed());
+        assert!(lib.allowed_for_current_platform());
     }
 
     #[test]
     fn test_library_is_allowed_with_rules() {
         let lib = LibraryInfo {
             name: "test:lib:1.0".into(),
-            rules: Some(vec![crate::minecraft::version::Rule {
+            rules: vec![crate::minecraft::version::Rule {
                 action: "allow".into(),
                 os: Some(OsCondition {
-                    name: Some(current_os_name().into()),
+                    name: current_os_name().into(),
                     version: None,
                     arch: None,
                 }),
                 features: None,
-            }]),
+            }],
             ..Default::default()
         };
-        assert!(lib.is_allowed());
+        assert!(lib.allowed_for_current_platform());
     }
 
     #[test]
