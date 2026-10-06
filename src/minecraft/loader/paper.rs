@@ -12,6 +12,8 @@ use tracing::{debug, info};
 const PAPER_FILL_BASE: &str = "https://fill.papermc.io/v3/projects/paper";
 const PAPER_USER_AGENT: &str = "JLUCraft-minecraftd/1.0 (https://github.com/JLUCraft/minecraftd)";
 const PAPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const PAPER_FETCH_BACKOFF: Duration = Duration::from_millis(500);
+const PAPER_MAX_ATTEMPTS: u32 = 3;
 const PAPER_MAX_JAR_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +47,78 @@ fn paper_client() -> Result<reqwest::Client, LoaderInstallError> {
         .build()?)
 }
 
+/// Runs `operation` up to `PAPER_MAX_ATTEMPTS` times with linear backoff.
+/// Upstream occasionally returns corrupted bodies under load ("error decoding
+/// response body"), so transient transfer failures are retried before giving
+/// up with the attempt count in the error message.
+async fn with_retry<T, Fut>(
+    context: &str,
+    mut operation: impl FnMut() -> Fut,
+) -> Result<T, LoaderInstallError>
+where
+    Fut: std::future::Future<Output = Result<T, LoaderInstallError>>,
+{
+    let mut last_error: Option<LoaderInstallError> = None;
+    for attempt in 1..=PAPER_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt < PAPER_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        "{context} failed (attempt {attempt}/{PAPER_MAX_ATTEMPTS}): {error}"
+                    );
+                    tokio::time::sleep(PAPER_FETCH_BACKOFF * attempt).await;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    let last = last_error.expect("loop runs at least once");
+    let context = format!("{context} failed after {PAPER_MAX_ATTEMPTS} attempts");
+    Err(match last {
+        LoaderInstallError::Network(message) => {
+            LoaderInstallError::Network(format!("{context}: {message}"))
+        }
+        LoaderInstallError::Parse(message) => {
+            LoaderInstallError::Parse(format!("{context}: {message}"))
+        }
+        LoaderInstallError::InstallFailed(message) => {
+            LoaderInstallError::InstallFailed(format!("{context}: {message}"))
+        }
+        other => other,
+    })
+}
+
+/// Fetches a JSON document with bounded retries. Non-JSON payloads are
+/// reported with a body snippet.
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, LoaderInstallError> {
+    with_retry(&format!("Paper API request to {url}"), || {
+        fetch_json_once::<T>(client, url)
+    })
+    .await
+}
+
+async fn fetch_json_once<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, LoaderInstallError> {
+    let body: String = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    serde_json::from_str(&body).map_err(|error| {
+        LoaderInstallError::Parse(format!(
+            "invalid JSON from {url}: {error}; body: {}",
+            body.chars().take(200).collect::<String>()
+        ))
+    })
+}
 fn latest_stable(builds: &[PaperBuild]) -> Result<String, LoaderInstallError> {
     builds
         .iter()
@@ -141,13 +215,7 @@ impl PaperInstaller {
                 "{PAPER_FILL_BASE}/versions/{}/builds",
                 urlencoding::encode(mc_version)
             );
-            let builds: Vec<PaperBuild> = paper_client()?
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let builds: Vec<PaperBuild> = fetch_json(&paper_client()?, &url).await?;
             return latest_stable(&builds);
         }
         let url = format!(
@@ -202,19 +270,28 @@ impl PaperInstaller {
         build: &str,
         destination: &Path,
     ) -> Result<(), LoaderInstallError> {
+        with_retry(&format!("Paper build {build} download"), || {
+            self.download_paper_once(mc_version, build, destination)
+        })
+        .await
+    }
+
+    /// Downloads and verifies a single Paper build attempt. The destination
+    /// file is only written after the checksum verifies, so a failed attempt
+    /// never overwrites the installed jar and the whole step can be retried.
+    async fn download_paper_once(
+        &self,
+        mc_version: &str,
+        build: &str,
+        destination: &Path,
+    ) -> Result<(), LoaderInstallError> {
         let client: reqwest::Client = paper_client()?;
         let url: String = format!(
             "{PAPER_FILL_BASE}/versions/{}/builds/{}",
             urlencoding::encode(mc_version),
             urlencoding::encode(build)
         );
-        let metadata: PaperBuild = client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let metadata: PaperBuild = fetch_json(&client, &url).await?;
         if metadata.id.to_string() != build {
             return Err(LoaderInstallError::Parse(
                 "Paper build mismatch".to_string(),
@@ -380,6 +457,70 @@ mod tests {
     fn test_paper_installer_type() {
         let installer = PaperInstaller::paper();
         assert_eq!(installer.loader_type(), ModLoaderType::Paper);
+    }
+
+    /// Serves `bodies` in order, one HTTP response per connection, then hangs up.
+    async fn mock_http_server(bodies: Vec<&'static str>) -> u16 {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn fetch_json_recovers_from_transient_bad_payloads() {
+        let port = mock_http_server(vec![
+            "garbage",
+            "still garbage",
+            r#"{"id":9,"channel":"STABLE","downloads":{}}"#,
+        ])
+        .await;
+        let client = paper_client().unwrap();
+        let url = format!("http://127.0.0.1:{port}/builds");
+        let build: PaperBuild = fetch_json(&client, &url).await.unwrap();
+        assert_eq!(build.id, 9);
+    }
+
+    #[tokio::test]
+    async fn fetch_json_gives_up_after_bounded_attempts() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let port = {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ngarbage";
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            port
+        };
+        let client = paper_client().unwrap();
+        let url = format!("http://127.0.0.1:{port}/builds");
+        let result: Result<PaperBuild, LoaderInstallError> = fetch_json(&client, &url).await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "expected exactly 3 attempts before giving up"
+        );
     }
 
     #[test]
