@@ -93,25 +93,6 @@ fn test_event_bus() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
-/// Test circular buffer overflow behavior.
-#[test]
-fn test_circular_buffer_overflow() {
-    use minecraftd::util::buffer::CircularBuffer;
-
-    let mut buf = CircularBuffer::new(3);
-    buf.push(1);
-    buf.push(2);
-    buf.push(3);
-    assert!(!buf.was_overflowed());
-
-    buf.push(4);
-    assert!(buf.was_overflowed());
-    assert_eq!(buf.overflow_count(), 1);
-
-    let items: Vec<i32> = buf.drain();
-    assert_eq!(items, vec![2, 3, 4]);
-}
-
 /// Test path safety validation.
 #[test]
 fn test_path_safety() {

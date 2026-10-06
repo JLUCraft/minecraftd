@@ -52,15 +52,12 @@ uuid = { version = "1", features = ["v7", "serde"] }
 walkdir = "2"
 url = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-humantime = "2"
-ctrlc = "3"
 interprocess = { version = "2", features = ["tokio"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "user"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
