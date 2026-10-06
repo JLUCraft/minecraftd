@@ -44,6 +44,7 @@ fn paper_client() -> Result<reqwest::Client, LoaderInstallError> {
         .timeout(PAPER_REQUEST_TIMEOUT)
         .build()?)
 }
+
 fn latest_stable(builds: &[PaperBuild]) -> Result<String, LoaderInstallError> {
     builds
         .iter()
@@ -63,13 +64,12 @@ fn verify_paper_bytes(download: &PaperDownload, bytes: &[u8]) -> Result<(), Load
     Ok(())
 }
 
-const PAPER_API_BASE: &str = "https://api.papermc.io/v2/projects";
+const PURPUR_API_BASE: &str = "https://api.purpurmc.org/v2";
 
 /// Server platform supported by the Paper installer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaperPlatform {
     Paper,
-    Spigot,
     Purpur,
 }
 
@@ -78,7 +78,6 @@ impl PaperPlatform {
     pub const fn project_name(&self) -> &'static str {
         match self {
             Self::Paper => "paper",
-            Self::Spigot => "spigot",
             Self::Purpur => "purpur",
         }
     }
@@ -87,22 +86,12 @@ impl PaperPlatform {
     pub const fn display_name(&self) -> &'static str {
         match self {
             Self::Paper => "Paper",
-            Self::Spigot => "Spigot",
             Self::Purpur => "Purpur",
-        }
-    }
-
-    #[must_use]
-    pub const fn api_base(&self) -> &'static str {
-        match self {
-            Self::Paper | Self::Spigot => PAPER_API_BASE,
-            // Purpur uses its own API endpoint
-            Self::Purpur => "https://api.purpurmc.org/v2",
         }
     }
 }
 
-/// Installer for Paper/Spigot/Purpur server platforms.
+/// Installer for Paper/Purpur server platforms.
 ///
 /// Unlike Forge or Fabric, these platforms ship a single server JAR
 /// that contains everything needed to run. No libraries or version JSON
@@ -124,47 +113,25 @@ impl PaperInstaller {
     }
 
     #[must_use]
-    pub const fn spigot() -> Self {
-        Self::new(PaperPlatform::Spigot)
-    }
-
-    #[must_use]
     pub const fn purpur() -> Self {
         Self::new(PaperPlatform::Purpur)
     }
 
-    /// Download URL for the classic v2-style artifact listing, used by
-    /// `install` for Spigot/Purpur. Paper itself ignores this: its downloads
-    /// are retired (HTTP 410) and the real artifact is resolved and verified
-    /// through Fill v3 in `download_paper` instead.
+    /// Download URL for the Purpur artifact listing. Paper itself ignores
+    /// this: its artifact is resolved and verified through Fill v3 in
+    /// `download_paper` instead.
     #[must_use]
     pub fn download_url(&self, mc_version: &str, build: &str) -> String {
-        match self.platform {
-            PaperPlatform::Paper | PaperPlatform::Spigot => {
-                format!(
-                    "{}/{}/versions/{}/builds/{}/downloads/{}-{}-{}.jar",
-                    self.platform.api_base(),
-                    self.platform.project_name(),
-                    mc_version,
-                    build,
-                    self.platform.project_name(),
-                    mc_version,
-                    build
-                )
-            }
-            PaperPlatform::Purpur => {
-                format!(
-                    "{}/{}/{}/builds/{}/downloads/{}-{}-{}.jar",
-                    self.platform.api_base(),
-                    self.platform.project_name(),
-                    mc_version,
-                    build,
-                    self.platform.project_name(),
-                    mc_version,
-                    build
-                )
-            }
-        }
+        format!(
+            "{}/{}/{}/builds/{}/downloads/{}-{}-{}.jar",
+            PURPUR_API_BASE,
+            self.platform.project_name(),
+            mc_version,
+            build,
+            self.platform.project_name(),
+            mc_version,
+            build
+        )
     }
 
     /// Fetches the latest successful build number for a Minecraft version.
@@ -183,24 +150,12 @@ impl PaperInstaller {
                 .await?;
             return latest_stable(&builds);
         }
-        let url = match self.platform {
-            PaperPlatform::Paper | PaperPlatform::Spigot => {
-                format!(
-                    "{}/{}/versions/{}",
-                    self.platform.api_base(),
-                    self.platform.project_name(),
-                    mc_version
-                )
-            }
-            PaperPlatform::Purpur => {
-                format!(
-                    "{}/{}/{}",
-                    self.platform.api_base(),
-                    self.platform.project_name(),
-                    mc_version
-                )
-            }
-        };
+        let url = format!(
+            "{}/{}/{}",
+            PURPUR_API_BASE,
+            self.platform.project_name(),
+            mc_version
+        );
 
         debug!(
             "fetching {} builds from {}",
@@ -218,7 +173,7 @@ impl PaperInstaller {
 
         let data: serde_json::Value = response.json().await?;
 
-        // Paper API: builds array with build numbers
+        // Purpur API: builds array with build numbers
         let builds = data["builds"]
             .as_array()
             .ok_or_else(|| LoaderInstallError::Parse("missing builds array".to_string()))?;
@@ -343,7 +298,6 @@ impl ModLoaderInstaller for PaperInstaller {
             self.fetch_latest_build(mc_version).await?
         };
 
-        let download_url = self.download_url(mc_version, &build);
         let server_jar = game_dir.join(format!(
             "{}-{}-{}.jar",
             self.platform.project_name(),
@@ -356,6 +310,7 @@ impl ModLoaderInstaller for PaperInstaller {
             return Ok(self.synthetic_version_info(mc_version, &build));
         }
 
+        let download_url = self.download_url(mc_version, &build);
         debug!(
             "downloading {} server from {}",
             self.platform.display_name(),
@@ -409,17 +364,7 @@ mod tests {
     #[test]
     fn test_paper_installer_platforms() {
         assert_eq!(PaperInstaller::paper().platform, PaperPlatform::Paper);
-        assert_eq!(PaperInstaller::spigot().platform, PaperPlatform::Spigot);
         assert_eq!(PaperInstaller::purpur().platform, PaperPlatform::Purpur);
-    }
-
-    #[test]
-    fn test_paper_download_url() {
-        let installer = PaperInstaller::paper();
-        let url = installer.download_url("1.20.4", "496");
-        assert!(url.contains("paper"));
-        assert!(url.contains("1.20.4"));
-        assert!(url.contains("496"));
     }
 
     #[test]
