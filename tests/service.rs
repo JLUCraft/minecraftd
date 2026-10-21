@@ -81,8 +81,13 @@ async fn test_service_auto_restart_crash() {
 
     service.start().await.unwrap();
 
-    // Wait for: start -> exit -> backoff -> restart -> exit -> max retries
-    tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+    // Wait for: start -> exit -> backoff -> restart -> exit -> max retries.
+    // Poll instead of sleeping a fixed span; a cold runner can stretch the
+    // backoff well past it.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
+    while service.state() != InstanceState::Stopped && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(service.state(), InstanceState::Stopped);
 
     service.shutdown().await.unwrap();
