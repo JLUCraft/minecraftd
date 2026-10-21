@@ -393,9 +393,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_client_instance_start_stop() {
+        use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().unwrap();
         let version_path = tmpdir.path().join("versions").join("1.20.4");
         std::fs::create_dir_all(&version_path).unwrap();
+        // A stub that outlives the launch so start and stop describe a live
+        // process; `echo` exits first and turns the test into a kill race.
+        let stub = tmpdir.path().join("java-stub.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut client = InstanceBuilder::new("cl".to_string(), InstancePath::new(&version_path))
             .spawner(LocalSpawner::new())
@@ -403,7 +409,7 @@ mod tests {
             .build_client(ClientConfig {
                 version_path,
                 java: JavaConfig {
-                    exec_path: "echo".into(),
+                    exec_path: stub.to_string_lossy().into_owned(),
                     ..Default::default()
                 },
                 ..Default::default()

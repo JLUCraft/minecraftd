@@ -183,8 +183,16 @@ impl ProcessHandle for LocalProcessHandle {
                 Signal::Kill => NixSignal::SIGKILL,
                 Signal::Int => NixSignal::SIGINT,
             };
-            signal::killpg(Pid::from_raw(self.pid as i32), nix_sig)
-                .map_err(|e| ProcessError::KillFailed(e.to_string()))?;
+            match signal::killpg(Pid::from_raw(self.pid as i32), nix_sig) {
+                Ok(()) => {}
+                // The process group can exit between the running check and the
+                // signal; stopping an already dead process is a success.
+                Err(nix::errno::Errno::ESRCH) => {
+                    self.running.store(false, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(error) => return Err(ProcessError::KillFailed(error.to_string())),
+            }
         }
 
         #[cfg(windows)]
