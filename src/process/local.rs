@@ -205,6 +205,25 @@ impl ProcessHandle for LocalProcessHandle {
                 .await
                 .map_err(|e| ProcessError::KillFailed(e.to_string()))?;
             if !output.status.success() {
+                // taskkill reports a pid that already exited as a failure; a
+                // stop racing with process exit is still a successful stop.
+                let mut exit = self.exit_watch.clone();
+                let exited = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        if exit.borrow().is_some() {
+                            return;
+                        }
+                        if exit.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .is_ok();
+                if exited {
+                    self.running.store(false, Ordering::SeqCst);
+                    return Ok(());
+                }
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(ProcessError::KillFailed(stderr.to_string()));
             }
