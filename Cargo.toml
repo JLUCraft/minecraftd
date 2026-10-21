@@ -43,6 +43,7 @@ which = "8"
 toml = "1"
 md5 = "0.8"
 murmur2 = "0.1"
+lite-mc-ping = "0.2"
 quartz_nbt = { version = "0.2.9", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"

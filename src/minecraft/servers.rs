@@ -104,33 +104,17 @@ pub async fn save_servers_to_nbt(path: &Path, servers: &[GameServerInfo]) -> Ser
 
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PING_CONCURRENCY: usize = 10;
-const DEFAULT_PORT: u16 = 25565;
 async fn query_one(server: &mut GameServerInfo) {
-    let query = async {
-        let address = if server.ip.parse::<std::net::SocketAddr>().is_ok()
-            || (server.ip.contains(':')
-                && !server.ip.ends_with(']')
-                && server.ip.parse::<std::net::IpAddr>().is_err())
-        {
-            server.ip.clone()
-        } else if let Ok(ip) = server.ip.parse::<std::net::IpAddr>() {
-            std::net::SocketAddr::new(ip, DEFAULT_PORT).to_string()
-        } else {
-            format!("{}:{DEFAULT_PORT}", server.ip)
-        };
-        let address = tokio::net::lookup_host(address).await.ok()?.next()?;
-        crate::minecraft::ping::ping_java_server(address, PING_TIMEOUT)
-            .await
-            .ok()
+    let status = match crate::minecraft::ping::ping_java_server(&server.ip, PING_TIMEOUT).await {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::debug!(address = %server.ip, %error, "server query failed");
+            crate::minecraft::ping::ServerStatus::default()
+        }
     };
-    let status = tokio::time::timeout(PING_TIMEOUT, query)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
     server.is_queried = true;
     server.online = status.online;
-    server.latency = status.online.then_some(status.latency_ms);
+    server.latency = status.latency_ms;
     server.players_online = usize::try_from(status.current_players).unwrap_or_default();
     server.players_max = usize::try_from(status.max_players).unwrap_or_default();
     server.description = status.description;
