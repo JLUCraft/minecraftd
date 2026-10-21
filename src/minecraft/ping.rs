@@ -8,6 +8,8 @@ use tracing::debug;
 pub enum PingError {
     #[error(transparent)]
     Query(#[from] lite_mc_ping::Error),
+    #[error("invalid server address: {0}")]
+    Address(String),
     #[error("connection failed: {0}")]
     Connection(String),
 }
@@ -30,7 +32,7 @@ pub struct ServerStatus {
 /// # Errors
 /// Returns a query error for invalid addresses, network failures, or malformed status packets.
 pub async fn ping_java_server(address: &str, timeout: Duration) -> Result<ServerStatus, PingError> {
-    let address: ServerAddress = address.parse()?;
+    let address: ServerAddress = address.parse().map_err(PingError::Address)?;
     let options = PingOptions {
         measure_latency: true,
         use_srv: true,

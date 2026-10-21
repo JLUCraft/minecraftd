@@ -18,6 +18,12 @@ pub enum WorldError {
     #[error("invalid world metadata: {0}")]
     Invalid(String),
 }
+impl From<quartz_nbt::NbtStructureError> for WorldError {
+    fn from(error: quartz_nbt::NbtStructureError) -> Self {
+        Self::Metadata(quartz_nbt::NbtReprError::structure(error))
+    }
+}
+
 pub type WorldResult<T> = Result<T, WorldError>;
 pub type WorldDetails = std::collections::HashMap<String, serde_json::Value>;
 pub mod base;
