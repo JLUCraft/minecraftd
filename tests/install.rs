@@ -612,11 +612,17 @@ async fn test_forge_server_with_mod_end_to_end() {
 
     // Step 4: Start server via minecraftd InstanceBuilder
     // Forge uses run.sh script
+    // Forge installs run.sh and run.bat; on Windows "bash" resolves to WSL.
+    let start_command = if cfg!(windows) {
+        "cmd /c run.bat"
+    } else {
+        "bash run.sh"
+    };
     let mut server = InstanceBuilder::new("forge-test".to_string(), InstancePath::new(&game_dir))
         .spawner(LocalSpawner::new())
         .event_bus(TokioBroadcastBus::new())
         .build_server(ServerConfig {
-            start_command: "bash run.sh".into(),
+            start_command: start_command.into(),
             stop_command: "stop".into(),
             ..Default::default()
         });
