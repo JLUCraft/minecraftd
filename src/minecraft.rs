@@ -29,3 +29,5 @@ pub mod packs;
 pub mod archive;
 pub mod logs;
 pub mod options;
+
+mod nbt;
