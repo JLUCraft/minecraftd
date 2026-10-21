@@ -459,6 +459,14 @@ mod tests {
         assert_eq!(installer.loader_type(), ModLoaderType::Paper);
     }
 
+    /// Reads the request head before answering: a socket closed with unread
+    /// inbound data is reset on Windows, which discards the queued response.
+    async fn drain_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0_u8; 1024];
+        let _ = stream.read(&mut head).await;
+    }
+
     /// Serves `bodies` in order, one HTTP response per connection, then hangs up.
     async fn mock_http_server(bodies: Vec<&'static str>) -> u16 {
         use tokio::io::AsyncWriteExt;
@@ -467,6 +475,7 @@ mod tests {
         tokio::spawn(async move {
             for body in bodies {
                 let (mut stream, _) = listener.accept().await.unwrap();
+                drain_request(&mut stream).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -504,6 +513,7 @@ mod tests {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drain_request(&mut stream).await;
                     let response =
                         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ngarbage";
                     let _ = stream.write_all(response.as_bytes()).await;

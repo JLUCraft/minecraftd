@@ -248,6 +248,14 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// Reads the request head before answering: a socket closed with unread
+    /// inbound data is reset on Windows, which discards the queued response.
+    async fn drain_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0_u8; 1024];
+        let _ = stream.read(&mut head).await;
+    }
+
     #[test]
     fn test_download_task_builder() {
         let task = DownloadTask::new(
@@ -333,6 +341,7 @@ mod tests {
             let _ = ready_tx.send(());
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
+                drain_request(&mut stream).await;
                 let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
