@@ -49,7 +49,9 @@ impl MultiMcManifest {
                 let file = archive
                     .by_index(i)
                     .map_err(|error| ModpackError::Parse(error.to_string()))?;
-                let name = file.name();
+                let name = file
+                    .name()
+                    .map_err(|error| ModpackError::Parse(error.to_string()))?;
 
                 if name.ends_with("mmc-pack.json")
                     && let Some(last_slash) = name.rfind('/')

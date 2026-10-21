@@ -463,14 +463,14 @@ fn restore_backup_zip(
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry.name().to_string();
-
-        // Safety: reject path traversal
-        if name.contains("..") {
+        // Safety: `enclosed_name` rejects absolute and parent-directory entries.
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| "archive entry escapes the target directory".to_string())?;
+        if entry.is_symlink() {
             continue;
         }
-
-        let dest = target_dir.join(&name);
+        let dest = target_dir.join(relative);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;

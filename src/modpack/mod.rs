@@ -104,6 +104,7 @@ pub fn detect_format(path: &Path) -> Result<ModpackFormat, ModpackError> {
         .map_err(|e| ModpackError::Parse(format!("invalid zip archive: {e}")))?;
 
     for name in archive.file_names() {
+        let Ok(name) = name else { continue };
         if name == "manifest.json" {
             return Ok(ModpackFormat::CurseForge);
         }

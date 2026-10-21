@@ -221,7 +221,17 @@ fn extract_archive_zip_sync(archive_path: &Path, target_dir: &Path) -> Result<()
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-        let out_path = target_dir.join(entry.name());
+        // `enclosed_name` rejects absolute and parent-directory entries, so
+        // extraction cannot escape the target directory.
+        let Some(relative) = entry.enclosed_name() else {
+            return Err(ArchiveError::Compression(
+                "archive entry escapes the target directory".into(),
+            ));
+        };
+        if entry.is_symlink() {
+            continue;
+        }
+        let out_path = target_dir.join(relative);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;

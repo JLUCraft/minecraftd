@@ -34,7 +34,7 @@ reqwest = { version = "0.13", features = ["json", "stream", "query"] }
 urlencoding = "2"
 sha1 = "0.11"
 hex = "0.4"
-zip = "8"
+zip = "9"
 dirs = "7"
 semver = "1"
 regex = "1"
