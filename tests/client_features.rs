@@ -221,4 +221,12 @@ fn embedded_native_catalog_and_mirror_origin_checks() {
             .unwrap()
             .is_empty()
     );
+    assert!(!minecraftd::minecraft::natives::needs_native_replacements(
+        &minecraftd::minecraft::profile::RulePlatform {
+            os: "linux".into(),
+            arch: "x64".into(),
+            version: String::new()
+        },
+        false,
+    ));
 }

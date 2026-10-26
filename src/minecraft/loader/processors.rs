@@ -3,7 +3,9 @@ use crate::download::request::DownloadParam;
 use crate::minecraft::dependencies::{convert_library_name_to_path, merge_library_lists};
 use crate::minecraft::loader::installer::LoaderInstallError;
 use crate::minecraft::loaders::ModLoaderType;
-use crate::minecraft::profile::{LibrariesValue, McClientInfo, reset_fields_from_patches};
+use crate::minecraft::profile::{
+    LibrariesValue, McClientInfo, RulePlatform, reset_fields_from_patches,
+};
 use crate::resource::{ResourceType, SourceType, convert_url_to_target_source, get_download_api};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -104,10 +106,11 @@ pub fn add_library_entry(
     *libraries = merge_library_lists(libraries, &[library]);
     Ok(())
 }
-pub fn prepare_libraries(
+pub async fn prepare_libraries(
     priority: &[SourceType],
     target: &InstallTarget<'_>,
     client_info: &mut McClientInfo,
+    platform: &RulePlatform,
 ) -> Result<Vec<DownloadParam>> {
     let source = *priority
         .first()
@@ -279,33 +282,6 @@ pub fn prepare_libraries(
             let name = &lib.name;
             add_library_entry(&mut client_info.libraries, name, Some(lib.clone()))?;
             add_library_entry(&mut loader_libraries, name, Some(lib.clone()))?;
-
-            let url = lib
-                .downloads
-                .as_ref()
-                .and_then(|d| d.artifact.as_ref())
-                .map(|a| a.url.as_str())
-                .unwrap_or_default();
-            if url.is_empty() {
-                continue;
-            }
-
-            task_params.push(DownloadParam {
-                src: convert_url_to_target_source(
-                    &Url::parse(url)?,
-                    &[
-                        ResourceType::ForgeMaven,
-                        ResourceType::ForgeMavenNew,
-                        ResourceType::NeoforgeMaven,
-                        ResourceType::CleanroomMaven,
-                        ResourceType::Libraries,
-                    ],
-                    &source,
-                )?,
-                dest: lib_dir.join(&convert_library_name_to_path(name, None)?),
-                filename: None,
-                sha1: None,
-            });
         }
 
         let arguments = forge_info.arguments.clone();
@@ -435,10 +411,42 @@ pub fn prepare_libraries(
 
     reset_fields_from_patches(client_info);
 
-    let mut seen = std::collections::HashSet::new();
-    task_params.retain(|param| seen.insert(param.dest.clone()));
+    task_params.extend(
+        crate::minecraft::dependencies::download_plan(source, lib_dir, client_info, platform, true)
+            .await?,
+    );
 
-    Ok(task_params)
+    let mut missing = Vec::new();
+    for request in task_params {
+        let cached = match fs::metadata(&request.dest) {
+            Ok(metadata) if metadata.is_file() => {
+                if let Some(expected) = &request.sha1 {
+                    crate::util::hash::sha1_file(&request.dest)
+                        .await
+                        .map_err(|error| LoaderInstallError::Io(error.to_string()))?
+                        == *expected
+                } else {
+                    false
+                }
+            }
+            Ok(_) => {
+                return Err(LoaderInstallError::Io(format!(
+                    "library destination is not a file: {}",
+                    request.dest.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !cached {
+            missing.push(request);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    missing.retain(|param| seen.insert(param.dest.clone()));
+
+    Ok(missing)
 }
 #[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -562,8 +570,97 @@ mod tests {
         }
         jar.finish().unwrap();
     }
-    #[test]
-    fn all_families_resolve_processors_and_extract_embedded_libraries() {
+    #[tokio::test]
+    async fn installer_keeps_native_rows_and_downloads_only_missing_current_platform_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let libraries = dir.path().join("libraries");
+        let version_dir = dir.path().join("versions/example");
+        fs::create_dir_all(&version_dir).unwrap();
+        let target = InstallTarget {
+            loader: ModLoaderType::Forge,
+            loader_version: "1",
+            name: "example",
+            version_dir: &version_dir,
+            root_dir: dir.path(),
+            library_dir: &libraries,
+        };
+        let request = installer_download(
+            &[SourceType::Official],
+            target.loader,
+            "1.20.4",
+            "1",
+            None,
+            &libraries,
+        )
+        .unwrap();
+        let java_bytes = b"existing complete artifact";
+        let native_bytes = b"downloaded native artifact";
+        let java_hash = crate::util::hash::sha1_bytes(java_bytes);
+        let native_hash = crate::util::hash::sha1_bytes(native_bytes);
+        let rows: Vec<LibrariesValue> = serde_json::from_value(serde_json::json!([
+          {"name":"test:bridge:1","downloads":{"artifact":{"path":"test/bridge/1/bridge-1.jar","url":"https://example.test/java.jar","sha1":java_hash,"size":java_bytes.len()}}},
+          {"name":"test:bridge:1","natives":{"linux":"natives-linux"},"rules":[{"action":"allow","os":{"name":"linux","arch":"x64"}}],"downloads":{"classifiers":{"natives-linux":{"url":"https://example.test/linux.jar","sha1":native_hash,"size":native_bytes.len()}}}},
+          {"name":"test:bridge:1","natives":{"windows":"natives-windows"},"rules":[{"action":"allow","os":{"name":"windows"}}],"downloads":{"classifiers":{"natives-windows":{"path":"test/bridge/1/bridge-1-natives-windows.jar","url":"https://example.test/windows.jar","sha1":"windows","size":1}}}}
+        ])).unwrap();
+        archive(
+            &request.dest,
+            &[
+                (
+                    "install_profile.json",
+                    serde_json::to_string(&InstallProfile::default()).unwrap(),
+                ),
+                (
+                    "version.json",
+                    serde_json::to_string(&McClientInfo {
+                        libraries: rows,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            ],
+        );
+        let cached = libraries.join("test/bridge/1/bridge-1.jar");
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(&cached, java_bytes).unwrap();
+        let platform = RulePlatform {
+            os: "linux".into(),
+            arch: "x64".into(),
+            version: String::new(),
+        };
+        let mut client = McClientInfo {
+            patches: vec![McClientInfo {
+                id: "game".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+            .await
+            .unwrap();
+        assert_eq!(client.libraries.len(), 3);
+        assert_eq!(downloads.len(), 1);
+        assert!(downloads[0].dest.ends_with("bridge-1-natives-linux.jar"));
+        assert_eq!(downloads[0].sha1.as_deref(), Some(native_hash.as_str()));
+        fs::write(&downloads[0].dest, native_bytes).unwrap();
+        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+            .await
+            .unwrap();
+        assert!(downloads.is_empty());
+        assert_eq!(
+            fs::read_to_string(cached).unwrap(),
+            "existing complete artifact"
+        );
+        let cached = libraries.join("test/bridge/1/bridge-1.jar");
+        fs::write(&cached, "corrupt cached bytes").unwrap();
+        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+            .await
+            .unwrap();
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].dest, cached);
+        assert_eq!(downloads[0].sha1.as_deref(), Some(java_hash.as_str()));
+    }
+    #[tokio::test]
+    async fn all_families_resolve_processors_and_extract_embedded_libraries() {
         for loader in [
             ModLoaderType::Forge,
             ModLoaderType::NeoForge,
@@ -660,8 +757,14 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let downloads =
-                prepare_libraries(&[SourceType::Official], &target, &mut client).unwrap();
+            let downloads = prepare_libraries(
+                &[SourceType::Official],
+                &target,
+                &mut client,
+                &RulePlatform::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(downloads.len(), 1);
             assert!(
                 downloads[0]
@@ -682,8 +785,8 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn rejects_empty_sources_and_unsafe_embedded_paths() {
+    #[tokio::test]
+    async fn rejects_empty_sources_and_unsafe_embedded_paths() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             installer_download(&[], ModLoaderType::Forge, "1.20.4", "1.0", None, dir.path())
@@ -711,8 +814,10 @@ mod tests {
             prepare_libraries(
                 &[SourceType::Official],
                 &target,
-                &mut McClientInfo::default()
+                &mut McClientInfo::default(),
+                &RulePlatform::default()
             )
+            .await
             .is_err()
         );
     }
