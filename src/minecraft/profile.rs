@@ -2,7 +2,7 @@
 use crate::minecraft::loaders::ModLoaderType;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
@@ -12,7 +12,7 @@ pub enum ProfileError {
     Regex(#[from] regex::Error),
 }
 type ProfileResult<T> = Result<T, ProfileError>;
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RulePlatform {
     pub os: String,
     pub arch: String,
@@ -22,7 +22,13 @@ impl Default for RulePlatform {
     fn default() -> Self {
         Self {
             os: std::env::consts::OS.into(),
-            arch: std::env::consts::ARCH.into(),
+            // This field uses the rule protocol's architecture token, not a host triple.
+            arch: if cfg!(target_arch = "x86_64") {
+                "x64"
+            } else {
+                std::env::consts::ARCH
+            }
+            .into(),
             version: String::new(),
         }
     }
@@ -156,7 +162,7 @@ impl Serialize for ArgumentsItem {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InstructionRule {
     pub action: String,
@@ -166,7 +172,7 @@ pub struct InstructionRule {
     pub os: Option<OsInfo>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OsInfo {
     pub name: String,
@@ -176,7 +182,7 @@ pub struct OsInfo {
     pub arch: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq, Hash)]
 #[serde(default)]
 pub struct FeaturesInfo {
     #[serde(skip)]
@@ -348,13 +354,11 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
         .any(|patch| matches!(patch.id.as_str(), "cleanroom" | "forge" | "legacyforge"));
 
     client_info.libraries.clear();
-    let mut library_names = HashSet::new();
     for patch in &patches {
-        for library in &patch.libraries {
-            if library_names.insert(library.name.clone()) {
-                client_info.libraries.push(library.clone());
-            }
-        }
+        client_info.libraries = crate::minecraft::dependencies::merge_library_lists(
+            &client_info.libraries,
+            &patch.libraries,
+        );
     }
 
     client_info.main_class = base.main_class.clone();
@@ -704,4 +708,22 @@ mod tests {
                 .contains("optifine")
         );
     }
+}
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn host_platform_uses_the_rule_architecture_token() {
+    let platform = RulePlatform::default();
+    assert_eq!(platform.arch, "x64");
+    let rule: InstructionRule =
+        serde_json::from_str(r#"{"action":"allow","os":{"arch":"x64"}}"#).unwrap();
+    assert!(
+        rules_is_allowed(
+            &[rule],
+            &FeaturesInfo {
+                platform,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+    );
 }

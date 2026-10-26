@@ -8,7 +8,7 @@ pub fn native_replacements() -> Result<NativeReplacements, serde_json::Error> {
 #[must_use]
 pub fn needs_native_replacements(platform: &RulePlatform, newer_than_1201: bool) -> bool {
     if platform.os == "windows"
-        || (matches!(platform.arch.as_str(), "x86" | "x86_64")
+        || (matches!(platform.arch.as_str(), "x86" | "x64")
             && matches!(platform.os.as_str(), "linux" | "macos"))
     {
         return false;
