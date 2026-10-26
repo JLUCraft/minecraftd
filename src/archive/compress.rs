@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tracing::{debug, trace};
@@ -197,6 +197,9 @@ fn create_archive_tar_gz_sync(
 
 /// Extracts a zip archive to a target directory.
 ///
+/// Existing destination links are rejected. The caller must keep the destination
+/// directory tree exclusively controlled for the duration of extraction.
+///
 /// # Errors
 ///
 /// Returns `ArchiveError` if the archive is invalid or I/O errors occur.
@@ -217,12 +220,13 @@ fn extract_archive_zip_sync(archive_path: &Path, target_dir: &Path) -> Result<()
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| ArchiveError::Compression(e.to_string()))?;
 
+    ensure_restore_directory(target_dir)?;
+
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-        // `enclosed_name` rejects absolute and parent-directory entries, so
-        // extraction cannot escape the target directory.
+        // Validate archive paths separately from existing destination entries.
         let Some(relative) = entry.enclosed_name() else {
             return Err(ArchiveError::Compression(
                 "archive entry escapes the target directory".into(),
@@ -231,19 +235,83 @@ fn extract_archive_zip_sync(archive_path: &Path, target_dir: &Path) -> Result<()
         if entry.is_symlink() {
             continue;
         }
-        let out_path = target_dir.join(relative);
-
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
+        let mut out_path = target_dir.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(name) => out_path.push(name),
+                Component::CurDir => continue,
+                _ => {
+                    return Err(ArchiveError::Compression(
+                        "archive entry escapes the target directory".into(),
+                    ));
+                }
             }
-            let mut outfile = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut outfile)?;
+            if components.peek().is_some() || entry.is_dir() {
+                ensure_restore_directory(&out_path)?;
+            } else {
+                reject_restore_symlink(&out_path)?;
+                let mut options = std::fs::OpenOptions::new();
+                // Truncate only after checking the opened file metadata.
+                options.write(true).create(true).truncate(false);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(nix::libc::O_NOFOLLOW);
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    // Open the reparse point itself, not its target.
+                    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+                }
+                let mut outfile = options.open(&out_path)?;
+                let metadata = outfile.metadata()?;
+                if is_restore_link(&metadata) || !metadata.is_file() {
+                    return Err(ArchiveError::Compression(format!(
+                        "restore destination is not a regular file: {}",
+                        out_path.display()
+                    )));
+                }
+                outfile.set_len(0)?;
+                std::io::copy(&mut entry, &mut outfile)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+fn is_restore_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn reject_restore_symlink(path: &Path) -> Result<(), ArchiveError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if is_restore_link(&metadata) => Err(ArchiveError::Compression(format!(
+            "restore destination contains a symbolic link: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_restore_directory(path: &Path) -> Result<(), ArchiveError> {
+    reject_restore_symlink(path)?;
+    std::fs::create_dir_all(path)?;
+    reject_restore_symlink(path)?;
     Ok(())
 }
 
@@ -341,6 +409,70 @@ mod tests {
         assert!(extract_dir.join("world/level.dat").exists());
         assert!(extract_dir.join("world/subdir/region.mca").exists());
         assert!(extract_dir.join("server.properties").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn zip_restore_rejects_existing_destination_links()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        for link_kind in ["directory", "file", "dangling", "root"] {
+            let temp = tempfile::tempdir()?;
+            let source = temp.path().join("source");
+            std::fs::create_dir_all(source.join("world"))?;
+            std::fs::write(source.join("world/level.dat"), b"replacement")?;
+            let archive = temp.path().join("backup.zip");
+            create_archive_zip(&source, &archive, &[PathBuf::from("world")]).await?;
+            let outside = temp.path().join("outside");
+            std::fs::create_dir_all(outside.join("world"))?;
+            std::fs::write(outside.join("level.dat"), b"external data")?;
+            std::fs::write(outside.join("world/level.dat"), b"external world")?;
+            let target = temp.path().join("restored");
+            if link_kind == "root" {
+                symlink(&outside, &target)?;
+            } else {
+                std::fs::create_dir_all(&target)?;
+                if link_kind == "directory" {
+                    symlink(&outside, target.join("world"))?;
+                } else {
+                    std::fs::create_dir_all(target.join("world"))?;
+                    let destination = if link_kind == "dangling" {
+                        outside.join("missing.dat")
+                    } else {
+                        outside.join("level.dat")
+                    };
+                    symlink(destination, target.join("world/level.dat"))?;
+                }
+            }
+            assert!(
+                extract_archive_zip(&archive, &target).await.is_err(),
+                "{link_kind}"
+            );
+            assert_eq!(std::fs::read(outside.join("level.dat"))?, b"external data");
+            assert_eq!(
+                std::fs::read(outside.join("world/level.dat"))?,
+                b"external world"
+            );
+            assert!(!outside.join("missing.dat").exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zip_restore_overwrites_regular_files() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("world"))?;
+        std::fs::write(source.join("world/level.dat"), b"new")?;
+        let archive = temp.path().join("backup.zip");
+        create_archive_zip(&source, &archive, &[PathBuf::from("world")]).await?;
+        let target = temp.path().join("restored");
+        std::fs::create_dir_all(target.join("world"))?;
+        std::fs::write(target.join("world/level.dat"), b"previous longer contents")?;
+        extract_archive_zip(&archive, &target).await?;
+        assert_eq!(std::fs::read(target.join("world/level.dat"))?, b"new");
+        Ok(())
     }
 
     #[tokio::test]
