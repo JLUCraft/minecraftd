@@ -1,8 +1,8 @@
 //! Maven coordinates, classpath selection and native extraction.
 use crate::minecraft::loaders::ModLoaderType;
 use crate::minecraft::profile::{
-    DownloadsArtifact, FeaturesInfo, IsAllowed, LibrariesValue, McClientInfo, ProfileError,
-    RulePlatform,
+    DownloadsArtifact, FeaturesInfo, InstructionRule, IsAllowed, LibrariesValue, McClientInfo,
+    ProfileError, RulePlatform,
 };
 use semver::Version;
 use std::collections::{HashMap, HashSet};
@@ -65,7 +65,10 @@ pub fn get_nonnative_library_artifacts(
         if let Some(downloads) = &library.downloads
             && let Some(artifact) = &downloads.artifact
         {
-            artifacts.insert(artifact.clone());
+            artifacts.insert(DownloadsArtifact {
+                path: convert_library_name_to_path(&library.name, None)?,
+                ..artifact.clone()
+            });
         }
     }
     Ok(artifacts.into_iter().collect())
@@ -91,7 +94,10 @@ pub fn get_native_library_artifacts(
             && let Some(classifiers) = &downloads.classifiers
             && let Some(artifact) = classifiers.get(&native)
         {
-            artifacts.insert(artifact.clone());
+            artifacts.insert(DownloadsArtifact {
+                path: convert_library_name_to_path(&library.name, Some(native))?,
+                ..artifact.clone()
+            });
         }
     }
     Ok(artifacts.into_iter().collect())
@@ -134,9 +140,11 @@ struct LibraryKey {
     pack_name: String,
     classifier: Option<String>,
     extension: String,
+    natives: Option<Vec<(String, String)>>,
+    rules: Vec<InstructionRule>,
 }
 
-// merge two vectors of libraries, remove duplicates by name, keep the one with the highest version. also remove libraries with invalid names
+// Resolve versions within each artifact/platform selection, preserving native and rule variants.
 pub fn merge_library_lists(
     libraries_a: &[LibrariesValue],
     libraries_b: &[LibrariesValue],
@@ -150,6 +158,15 @@ pub fn merge_library_lists(
                 pack_name: parts.pack_name,
                 classifier: parts.classifier,
                 extension: parts.extension,
+                natives: library.natives.as_ref().map(|natives| {
+                    let mut entries = natives
+                        .iter()
+                        .map(|(os, classifier)| (os.clone(), classifier.clone()))
+                        .collect::<Vec<_>>();
+                    entries.sort();
+                    entries
+                }),
+                rules: library.rules.clone(),
             };
             if let Some(index) = positions.get(&key).copied() {
                 let existing = parse_library_name(&libraries[index].name, None)
@@ -236,7 +253,9 @@ pub fn get_nonnative_library_paths(
             }
         }
 
-        libraries.push(library.clone());
+        let mut selected = library.clone();
+        selected.rules.clear(); // Rules have already been evaluated for this platform.
+        libraries.push(selected);
     }
 
     libraries = merge_library_lists(&libraries, &[]); // remove duplicates to prevent launch errors
@@ -402,6 +421,48 @@ pub async fn download_plan(
 mod tests {
     use super::*;
     #[test]
+    fn preserves_artifact_native_and_platform_rows_through_patch_composition() {
+        let rows: Vec<LibrariesValue> = serde_json::from_value(serde_json::json!([
+          {"name":"test:bridge:1","downloads":{"artifact":{"path":"test/bridge/1/bridge-1.jar","url":"https://example.test/java.jar","sha1":"java","size":1}}},
+          {"name":"test:bridge:1","natives":{"linux":"natives-linux"},"rules":[{"action":"allow","os":{"name":"linux","arch":"x64"}}],"downloads":{"classifiers":{"natives-linux":{"path":"test/bridge/1/bridge-1-natives-linux.jar","url":"https://example.test/linux.jar","sha1":"linux","size":1}}}},
+          {"name":"test:bridge:1","natives":{"windows":"natives-windows"},"rules":[{"action":"allow","os":{"name":"windows"}}],"downloads":{"classifiers":{"natives-windows":{"path":"test/bridge/1/bridge-1-natives-windows.jar","url":"https://example.test/windows.jar","sha1":"windows","size":1}}}}
+        ])).unwrap();
+        let merged = merge_library_lists(&rows, &rows);
+        assert_eq!(merged.len(), 3);
+        let mut profile = McClientInfo {
+            patches: vec![McClientInfo {
+                libraries: rows,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::minecraft::profile::reset_fields_from_patches(&mut profile);
+        assert_eq!(profile.libraries, merged);
+        let platform = RulePlatform {
+            os: "linux".into(),
+            arch: "x64".into(),
+            version: String::new(),
+        };
+        assert_eq!(
+            get_nonnative_library_artifacts(&profile, &platform)
+                .unwrap()
+                .len(),
+            1
+        );
+        let natives = get_native_library_artifacts(&profile, &platform).unwrap();
+        assert_eq!(natives.len(), 1);
+        assert!(natives[0].path.ends_with("natives-linux.jar"));
+        let mut higher = profile.libraries[0].clone();
+        higher.name = "test:bridge:2".into();
+        let updated = merge_library_lists(&profile.libraries, &[higher]);
+        assert_eq!(updated.len(), 3);
+        assert_eq!(updated[0].name, "test:bridge:2");
+        assert_eq!(
+            updated.iter().filter(|row| row.natives.is_some()).count(),
+            2
+        );
+    }
+    #[test]
     fn maven_classifier_extension_and_traversal() {
         assert_eq!(
             convert_library_name_to_path("net.minecraftforge:forge:1.0:clientdata@lzma", None)
@@ -449,7 +510,7 @@ mod tests {
         };
         let platform = RulePlatform {
             os: "linux".into(),
-            arch: "x86_64".into(),
+            arch: "x64".into(),
             version: String::new(),
         };
         assert!(
