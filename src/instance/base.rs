@@ -68,6 +68,10 @@ pub trait Instance: Send + Sync + Debug {
     fn recent_output(&self, _n: usize) -> Vec<String> {
         Vec::new()
     }
+    /// Returns the first global line index and recent output, or an empty window without a buffer.
+    fn recent_output_with_offset(&self, _n: usize) -> (u64, Vec<String>) {
+        (0, Vec::new())
+    }
     /// Sets up the output ring buffer with the given capacity.
     fn setup_output_ring(&mut self, capacity: usize);
     /// Convenience: derive the absolute path to a well-known subdirectory.

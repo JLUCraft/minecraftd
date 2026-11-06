@@ -299,6 +299,14 @@ where
             .unwrap_or_default()
     }
 
+    fn recent_output_with_offset(&self, n: usize) -> (u64, Vec<String>) {
+        self.core
+            .output_ring
+            .as_ref()
+            .map(|r| r.recent_with_offset(n))
+            .unwrap_or_default()
+    }
+
     fn setup_output_ring(&mut self, capacity: usize) {
         self.core.output_ring = Some(crate::core::ring::OutputRingBuffer::new(capacity));
     }

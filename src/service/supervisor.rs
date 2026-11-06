@@ -127,6 +127,10 @@ impl<I: Instance + Debug> Supervisor<I> {
                             let _ = tx.send(self.instance.lock().await.recent_output(n));
                             Ok(())
                         }
+                        ControlMsg::GetRecentOutputWithOffset { n, tx } => {
+                            let _ = tx.send(self.instance.lock().await.recent_output_with_offset(n));
+                            Ok(())
+                        }
                         ControlMsg::Shutdown => self.handle_stop().await,
                         ControlMsg::Acknowledged { .. } => Err(InstanceError::Config("nested acknowledgement".into())),
                     };

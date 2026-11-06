@@ -7,8 +7,14 @@ use std::sync::Arc;
 /// Inspired by `MCSManager`'s terminal output buffer and SJMCL's log capture.
 #[derive(Debug, Clone)]
 pub struct OutputRingBuffer {
-    inner: Arc<parking_lot::Mutex<VecDeque<String>>>,
+    inner: Arc<parking_lot::Mutex<OutputRingState>>,
     capacity: usize,
+}
+
+#[derive(Debug)]
+struct OutputRingState {
+    lines: VecDeque<String>,
+    written: u64,
 }
 
 impl OutputRingBuffer {
@@ -16,7 +22,10 @@ impl OutputRingBuffer {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(capacity))),
+            inner: Arc::new(parking_lot::Mutex::new(OutputRingState {
+                lines: VecDeque::with_capacity(capacity),
+                written: 0,
+            })),
             capacity,
         }
     }
@@ -32,39 +41,51 @@ impl OutputRingBuffer {
     pub fn push_str(&self, text: &str) {
         let mut guard = self.inner.lock();
         for line in text.lines() {
-            if guard.len() >= self.capacity {
-                guard.pop_front();
+            guard.written += 1;
+            if self.capacity == 0 {
+                continue;
             }
-            guard.push_back(line.to_string());
+            if guard.lines.len() >= self.capacity {
+                guard.lines.pop_front();
+            }
+            guard.lines.push_back(line.to_string());
         }
     }
 
     /// Returns the most recent `n` lines of output.
     #[must_use]
     pub fn recent_lines(&self, n: usize) -> Vec<String> {
+        self.recent_with_offset(n).1
+    }
+
+    /// Returns the zero-based global index of the first returned line and up to `n` lines.
+    /// An empty window starts at the next write index. Clearing does not reset the index.
+    #[must_use]
+    pub fn recent_with_offset(&self, n: usize) -> (u64, Vec<String>) {
         let guard = self.inner.lock();
-        guard
+        let count = n.min(guard.lines.len());
+        let start = guard.written - count as u64;
+        let lines = guard
+            .lines
             .iter()
-            .rev()
-            .take(n)
+            .skip(guard.lines.len() - count)
             .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
+            .collect();
+        drop(guard);
+        (start, lines)
     }
 
     /// Returns all lines in the buffer.
     #[must_use]
     pub fn all_lines(&self) -> Vec<String> {
         let guard = self.inner.lock();
-        guard.iter().cloned().collect()
+        guard.lines.iter().cloned().collect()
     }
 
     /// Returns the number of lines stored.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().lines.len()
     }
 
     /// Returns true if the buffer is empty.
@@ -75,7 +96,7 @@ impl OutputRingBuffer {
 
     /// Clears all lines.
     pub fn clear(&self) {
-        self.inner.lock().clear();
+        self.inner.lock().lines.clear();
     }
 
     /// Returns the capacity.
@@ -94,6 +115,58 @@ impl Default for OutputRingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_with_offset_tracks_window_rollover() {
+        const CAPACITY: usize = 3;
+        let ring = OutputRingBuffer::new(CAPACITY);
+        assert_eq!(ring.recent_with_offset(CAPACITY), (0, vec![]));
+        ring.push_str("a\nb\n");
+        assert_eq!(
+            ring.recent_with_offset(CAPACITY),
+            (0, vec!["a".into(), "b".into()])
+        );
+        assert_eq!(ring.recent_with_offset(1), (1, vec!["b".into()]));
+        ring.push_str("c\n");
+        assert_eq!(
+            ring.recent_with_offset(CAPACITY),
+            (0, vec!["a".into(), "b".into(), "c".into()])
+        );
+        ring.push_str("d\ne\n");
+        assert_eq!(
+            ring.recent_with_offset(CAPACITY),
+            (2, vec!["c".into(), "d".into(), "e".into()])
+        );
+        ring.push_str("f\n");
+        assert_eq!(
+            ring.recent_with_offset(CAPACITY),
+            (3, vec!["d".into(), "e".into(), "f".into()])
+        );
+        assert_eq!(ring.recent_with_offset(0), (6, vec![]));
+        assert_eq!(
+            ring.recent_lines(CAPACITY),
+            ring.recent_with_offset(CAPACITY).1
+        );
+    }
+
+    #[test]
+    fn recent_with_offset_preserves_counter_after_clear() {
+        let ring = OutputRingBuffer::new(2);
+        ring.push_str("a\nb\nc\n");
+        ring.clear();
+        assert_eq!(ring.recent_with_offset(2), (3, vec![]));
+        ring.push_str("d\n");
+        assert_eq!(ring.recent_with_offset(2), (3, vec!["d".into()]));
+    }
+
+    #[test]
+    fn recent_with_offset_counts_writes_without_capacity() {
+        let ring = OutputRingBuffer::new(0);
+        ring.push_bytes(b"a\nb\n");
+        ring.push_bytes(&[0xff]);
+        assert!(ring.is_empty());
+        assert_eq!(ring.recent_with_offset(1), (2, vec![]));
+    }
 
     #[test]
     fn test_output_ring_basic() {

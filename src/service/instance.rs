@@ -154,6 +154,21 @@ impl InstanceService {
             .map_err(|_| InstanceServiceError::SupervisorShutdown)
     }
 
+    /// Retrieve up to `n` output lines with the zero-based global index of the first line.
+    /// Empty windows carry the next write index; clearing a buffer preserves its counter.
+    pub async fn recent_output_with_offset(
+        &self,
+        n: usize,
+    ) -> Result<(u64, Vec<String>), InstanceServiceError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.control_tx
+            .send(ControlMsg::GetRecentOutputWithOffset { n, tx })
+            .await
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)?;
+        rx.await
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)
+    }
+
     async fn send_control(&self, msg: ControlMsg) -> Result<(), InstanceServiceError> {
         let (reply, received) = tokio::sync::oneshot::channel();
         self.control_tx
@@ -193,6 +208,56 @@ mod tests {
     use crate::instance::path::InstancePath;
     use crate::instance::server::ServerConfig;
     use crate::process::local::LocalSpawner;
+
+    #[tokio::test]
+    async fn recent_output_with_offset_tracks_window_rollover()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const CAPACITY: usize = 3;
+        let mut instance = InstanceBuilder::new("output-offset".into(), InstancePath::new("."))
+            .spawner(LocalSpawner::new())
+            .event_bus(TokioBroadcastBus::new())
+            .build_server(ServerConfig::default());
+        let ring = crate::core::ring::OutputRingBuffer::new(CAPACITY);
+        instance.core.output_ring = Some(ring.clone());
+        let service = InstanceService::new(instance, RestartPolicy::never());
+
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await?,
+            (0, vec![])
+        );
+        ring.push_str("a\nb\n");
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await?,
+            (0, vec!["a".into(), "b".into()])
+        );
+        ring.push_str("c\n");
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await?,
+            (0, vec!["a".into(), "b".into(), "c".into()])
+        );
+        ring.push_str("d\ne\n");
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await?,
+            (2, vec!["c".into(), "d".into(), "e".into()])
+        );
+        ring.push_str("f\n");
+        assert_eq!(
+            service.recent_output_with_offset(2).await?,
+            (4, vec!["e".into(), "f".into()])
+        );
+        assert_eq!(service.recent_output(CAPACITY).await?, vec!["d", "e", "f"]);
+        ring.clear();
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await?,
+            (6, vec![])
+        );
+        service.shutdown().await?;
+        assert_eq!(
+            service.recent_output_with_offset(CAPACITY).await,
+            Err(InstanceServiceError::SupervisorShutdown)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn start_reports_process_failure() -> Result<(), Box<dyn std::error::Error>> {

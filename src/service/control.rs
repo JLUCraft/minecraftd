@@ -27,6 +27,11 @@ pub enum ControlMsg {
         n: usize,
         tx: oneshot::Sender<Vec<String>>,
     },
+    /// Query recent output lines and the first global line index.
+    GetRecentOutputWithOffset {
+        n: usize,
+        tx: oneshot::Sender<(u64, Vec<String>)>,
+    },
     /// Shutdown the supervisor loop.
     Shutdown,
 }
