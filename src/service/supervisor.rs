@@ -119,6 +119,10 @@ impl<I: Instance + Debug> Supervisor<I> {
                             let _ = tx.send(self.instance.lock().await.play_time_secs());
                             Ok(())
                         }
+                        ControlMsg::GetProcessId(tx) => {
+                            let _ = tx.send(self.instance.lock().await.process_handle().and_then(|process| process.pid()));
+                            Ok(())
+                        }
                         ControlMsg::GetRecentOutput { n, tx } => {
                             let _ = tx.send(self.instance.lock().await.recent_output(n));
                             Ok(())

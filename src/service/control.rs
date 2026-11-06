@@ -20,6 +20,8 @@ pub enum ControlMsg {
     SendCommand(String),
     /// Query the total play time in seconds.
     GetPlayTime(oneshot::Sender<u64>),
+    /// Query the operating-system process ID while the instance is running.
+    GetProcessId(oneshot::Sender<Option<u32>>),
     /// Query recent output lines.
     GetRecentOutput {
         n: usize,

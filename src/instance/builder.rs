@@ -1,6 +1,8 @@
 use crate::core::event::EventBus;
 use crate::core::process::ProcessSpawner;
-use crate::instance::base::InstanceCore;
+use crate::instance::base::{Instance, InstanceCore};
+
+const OUTPUT_RING_CAPACITY: usize = 1024;
 use crate::instance::client::{ClientConfig, ClientInstance};
 use crate::instance::path::InstancePath;
 use crate::instance::server::{ServerConfig, ServerInstance};
@@ -78,14 +80,18 @@ where
     pub fn build_server(self, config: ServerConfig) -> ServerInstance<S, E> {
         let mut core = InstanceCore::new(self.id, self.path, self.spawner, self.event_bus);
         core.lifecycle = self.lifecycle;
-        ServerInstance::with_core(core, config)
+        let mut instance = ServerInstance::with_core(core, config);
+        instance.setup_output_ring(OUTPUT_RING_CAPACITY);
+        instance
     }
 
     /// Builds a client instance.
     pub fn build_client(self, config: ClientConfig) -> ClientInstance<S, E> {
         let mut core = InstanceCore::new(self.id, self.path, self.spawner, self.event_bus);
         core.lifecycle = self.lifecycle;
-        ClientInstance::with_core(core, config)
+        let mut instance = ClientInstance::with_core(core, config);
+        instance.setup_output_ring(OUTPUT_RING_CAPACITY);
+        instance
     }
 }
 

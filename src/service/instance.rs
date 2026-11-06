@@ -99,6 +99,20 @@ impl InstanceService {
         rx.await.unwrap_or(0)
     }
 
+    /// Operating-system process ID, if the instance currently has a process.
+    pub async fn process_id(&self) -> Option<u32> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .control_tx
+            .send(ControlMsg::GetProcessId(tx))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
     /// Start the instance.
     pub async fn start(&self) -> Result<(), InstanceServiceError> {
         self.send_control(ControlMsg::Start).await
@@ -193,6 +207,7 @@ mod tests {
             RestartPolicy::never(),
         );
         assert!(service.start().await.is_err());
+        assert!(matches!(service.state(), InstanceState::Error(_)));
         service.shutdown().await?;
         Ok(())
     }
