@@ -126,10 +126,11 @@ impl<C: ResourceTransport> ModrinthClient<C> {
             return Err(ResourceError::Parse("invalid remote file name".into()));
         }
         Ok(Some(crate::download::request::DownloadParam {
-            src: file.download_url.parse()?,
+            sources: vec![file.download_url.parse()?],
             dest: directory.join(&file.file_name),
             filename: Some(file.file_name.clone()),
             sha1: Some(file.sha1.clone()),
+            size: None,
         }))
     }
     /// Searches for projects on Modrinth.

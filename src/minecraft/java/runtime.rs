@@ -65,7 +65,7 @@ pub async fn download_plan<C: ResourceTransport>(
                 let manifest = client
                     .request_json(url, &HashMap::new(), None, None)
                     .await?;
-                return files(&manifest, directory);
+                return files(&manifest, directory, sources);
             }
             Err(error) => last_error = error,
         }
@@ -73,7 +73,11 @@ pub async fn download_plan<C: ResourceTransport>(
     Err(last_error)
 }
 
-fn files(manifest: &Value, directory: &Path) -> Result<Vec<DownloadParam>, ResourceError> {
+fn files(
+    manifest: &Value,
+    directory: &Path,
+    sources: &[SourceType],
+) -> Result<Vec<DownloadParam>, ResourceError> {
     let entries = manifest["files"]
         .as_object()
         .ok_or_else(|| ResourceError::Parse("invalid Java runtime files".into()))?;
@@ -100,10 +104,11 @@ fn files(manifest: &Value, directory: &Path) -> Result<Vec<DownloadParam>, Resou
             .as_str()
             .ok_or_else(|| ResourceError::Parse(format!("missing Java download hash: {path}")))?;
         downloads.push(DownloadParam {
-            src: url.parse()?,
+            sources: crate::resource::get_download_urls(&url.parse()?, &[], sources)?,
             dest: directory.join(path),
             filename: None,
             sha1: Some(sha1.into()),
+            size: raw["size"].as_u64(),
         });
     }
     Ok(downloads)
@@ -116,11 +121,12 @@ mod tests {
     fn rejects_wrong_architecture_and_escaping_paths() {
         assert!(platform("linux", "aarch64").is_err());
         let manifest = serde_json::json!({"files": {"../java": {"type": "file"}}});
-        assert!(files(&manifest, Path::new("runtime")).is_err());
+        assert!(files(&manifest, Path::new("runtime"), &[SourceType::Official]).is_err());
         assert!(
             files(
                 &serde_json::json!({"files": {"bin/java": {"type":"file"}}}),
-                Path::new("runtime")
+                Path::new("runtime"),
+                &[SourceType::Official],
             )
             .is_err()
         );

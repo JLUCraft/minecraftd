@@ -10,6 +10,8 @@ pub enum DownloadSource {
     Bmclapi,
     /// Custom base URL.
     Custom(String),
+    /// A complete URL selected by a download plan.
+    Direct(String),
 }
 
 impl DownloadSource {
@@ -19,7 +21,7 @@ impl DownloadSource {
         match self {
             Self::Official => Some(SourceType::Official),
             Self::Bmclapi => Some(SourceType::Bmclapi),
-            Self::Custom(_) => None,
+            Self::Custom(_) | Self::Direct(_) => None,
         }
     }
 
@@ -30,6 +32,7 @@ impl DownloadSource {
             return original.to_owned();
         };
         match self {
+            Self::Direct(url) => url.clone(),
             Self::Official => original.to_owned(),
             Self::Bmclapi => convert_url_to_target_source(&url, &[], &SourceType::Bmclapi)
                 .unwrap_or(url)
@@ -75,6 +78,7 @@ impl DownloadSource {
         resource_type: crate::resource::ResourceType,
     ) -> String {
         match self {
+            Self::Direct(url) => url.clone(),
             Self::Official => original.to_string(),
             Self::Bmclapi => {
                 if let Ok(url) = Url::parse(original) {

@@ -48,14 +48,9 @@ impl AssetIndexClient {
         .await?;
         let tasks: Vec<DownloadTask> = requests
             .into_iter()
-            .map(|request| {
-                let mut task = DownloadTask::new(request.src.to_string(), request.dest);
-                if let Some(sha1) = request.sha1 {
-                    task = task.with_sha1(sha1);
-                }
-                task
-            })
-            .collect();
+            .map(DownloadTask::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AssetIndexError::Download(error.to_string()))?;
         if tasks.is_empty() {
             info!("all assets already present");
             return Ok(());
@@ -107,8 +102,11 @@ pub async fn plan_assets(
     source: crate::resource::SourceType,
     check_hash: bool,
 ) -> Result<Vec<crate::download::request::DownloadParam>, AssetIndexError> {
-    let root = crate::resource::get_download_api(source, crate::resource::ResourceType::Assets)
-        .map_err(|error| AssetIndexError::Parse(error.to_string()))?;
+    let root = crate::resource::get_download_api(
+        crate::resource::SourceType::Official,
+        crate::resource::ResourceType::Assets,
+    )
+    .map_err(|error| AssetIndexError::Parse(error.to_string()))?;
     let mut requests = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in index.objects.values() {
@@ -126,12 +124,18 @@ pub async fn plan_assets(
             continue;
         }
         requests.push(crate::download::request::DownloadParam {
-            src: root
-                .join(&relative)
-                .map_err(|error| AssetIndexError::Parse(error.to_string()))?,
+            sources: crate::resource::get_download_urls(
+                &root
+                    .join(&relative)
+                    .map_err(|error| AssetIndexError::Parse(error.to_string()))?,
+                &[crate::resource::ResourceType::Assets],
+                &[source],
+            )
+            .map_err(|error| AssetIndexError::Parse(error.to_string()))?,
             dest,
             filename: None,
             sha1: Some(entry.hash.clone()),
+            size: Some(entry.size),
         });
     }
     Ok(requests)

@@ -406,12 +406,13 @@ pub async fn download_plan(
             return Err(DependencyError::MissingDownload(artifact.path));
         }
         let url = url::Url::parse(&artifact.url).map_err(crate::resource::ResourceError::from)?;
-        let src = crate::resource::convert_url_to_target_source(&url, &[], &source)?;
+        let sources = crate::resource::get_download_urls(&url, &[], &[source])?;
         downloads.push(crate::download::request::DownloadParam {
-            src,
+            sources,
             dest: destination,
             filename: None,
             sha1: Some(artifact.sha1),
+            size: Some(artifact.size),
         });
     }
     Ok(downloads)

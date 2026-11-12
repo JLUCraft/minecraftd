@@ -92,18 +92,12 @@ impl ModpackManifest for CurseForgeManifest {
             ModpackError::Api("MINECRAFTD_CURSEFORGE_API_KEY not set".to_string())
         })?;
 
-        Ok(self
-            .download_requests(&client, instance_path)
+        self.download_requests(&client, instance_path)
             .await?
             .into_iter()
-            .map(|request| {
-                let mut task = DownloadTask::new(request.src.to_string(), request.dest);
-                if let Some(sha1) = request.sha1 {
-                    task = task.with_sha1(sha1);
-                }
-                task
-            })
-            .collect())
+            .map(DownloadTask::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ModpackError::Network(error.to_string()))
     }
 
     fn overrides_path(&self) -> String {
@@ -137,9 +131,10 @@ impl CurseForgeManifest {
                 .download_url
                 .unwrap_or_else(|| fallback_download_url(file.id, name));
             requests.push(crate::download::request::DownloadParam {
-                src: url
-                    .parse()
-                    .map_err(|error: url::ParseError| ModpackError::Parse(error.to_string()))?,
+                sources: vec![
+                    url.parse()
+                        .map_err(|error: url::ParseError| ModpackError::Parse(error.to_string()))?,
+                ],
                 dest: instance.join(directory).join(name),
                 filename: Some(name.clone()),
                 sha1: file
@@ -147,6 +142,7 @@ impl CurseForgeManifest {
                     .iter()
                     .find(|hash| hash.algo == 1)
                     .map(|hash| hash.value.clone()),
+                size: None,
             });
         }
         Ok(requests)

@@ -62,6 +62,28 @@ pub struct DownloadTask {
     pub retry_config: Option<RetryConfig>,
 }
 
+impl TryFrom<crate::download::request::DownloadParam> for DownloadTask {
+    type Error = DownloadError;
+    fn try_from(request: crate::download::request::DownloadParam) -> Result<Self, Self::Error> {
+        let url = request
+            .sources
+            .first()
+            .ok_or(DownloadError::AllSourcesFailed)?
+            .to_string();
+        Ok(Self {
+            url,
+            destination: request.dest,
+            expected_sha1: request.sha1,
+            sources: request
+                .sources
+                .into_iter()
+                .map(|url| DownloadSource::Direct(url.to_string()))
+                .collect(),
+            retry_config: None,
+        })
+    }
+}
+
 impl DownloadTask {
     /// Creates a new `DownloadTask`.
     #[must_use]

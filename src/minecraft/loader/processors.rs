@@ -6,7 +6,7 @@ use crate::minecraft::loaders::ModLoaderType;
 use crate::minecraft::profile::{
     LibrariesValue, McClientInfo, RulePlatform, reset_fields_from_patches,
 };
-use crate::resource::{ResourceType, SourceType, convert_url_to_target_source, get_download_api};
+use crate::resource::{ResourceType, SourceType, get_download_api};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -41,56 +41,67 @@ pub fn installer_download(
     branch: Option<&str>,
     library_dir: &Path,
 ) -> Result<DownloadParam> {
-    let source = *priority
-        .first()
-        .ok_or_else(|| LoaderInstallError::Network("no sources configured".into()))?;
+    if priority.is_empty() {
+        return Err(LoaderInstallError::Network("no sources configured".into()));
+    }
     let coordinate = family_coordinate(loader, version)?;
-    let src = match loader {
-        ModLoaderType::Forge | ModLoaderType::LegacyForge => {
-            let root = get_download_api(source, ResourceType::ForgeInstall)?;
-            if source == SourceType::Official {
-                let version = [game_version, version, branch.unwrap_or_default()]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("-");
-                root.join(&format!("{version}/forge-{version}-installer.jar"))?
-            } else {
-                let mut url = root;
-                url.query_pairs_mut().extend_pairs([
-                    ("mcversion", game_version),
-                    ("version", version),
-                    ("branch", branch.unwrap_or_default()),
-                    ("category", "installer"),
-                    ("format", "jar"),
-                ]);
-                url
+    let mut sources = Vec::new();
+    for source in priority
+        .iter()
+        .copied()
+        .chain(SourceType::iter().filter(|source| !priority.contains(source)))
+    {
+        let src = match loader {
+            ModLoaderType::Forge | ModLoaderType::LegacyForge => {
+                let root = get_download_api(source, ResourceType::ForgeInstall)?;
+                if source == SourceType::Official {
+                    let version = [game_version, version, branch.unwrap_or_default()]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    root.join(&format!("{version}/forge-{version}-installer.jar"))?
+                } else {
+                    let mut url = root;
+                    url.query_pairs_mut().extend_pairs([
+                        ("mcversion", game_version),
+                        ("version", version),
+                        ("branch", branch.unwrap_or_default()),
+                        ("category", "installer"),
+                        ("format", "jar"),
+                    ]);
+                    url
+                }
             }
-        }
-        ModLoaderType::Cleanroom => get_download_api(source, ResourceType::CleanroomInstall)?
-            .join(&format!("cleanroom-{version}-installer.jar"))?,
-        ModLoaderType::NeoForge => {
-            if version.starts_with("1.20.1-") {
-                get_download_api(SourceType::Official, ResourceType::NeoforgeInstall)?.join(
-                    &format!("net/neoforged/forge/{version}/forge-{version}-installer.jar"),
-                )?
-            } else if source == SourceType::Official {
-                get_download_api(source, ResourceType::NeoforgeInstall)?.join(&format!(
-                    "net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar"
-                ))?
-            } else {
-                get_download_api(source, ResourceType::NeoforgeInstall)?
-                    .join(&format!("{version}/download/installer"))?
+            ModLoaderType::Cleanroom => get_download_api(source, ResourceType::CleanroomInstall)?
+                .join(&format!("cleanroom-{version}-installer.jar"))?,
+            ModLoaderType::NeoForge => {
+                if version.starts_with("1.20.1-") {
+                    get_download_api(SourceType::Official, ResourceType::NeoforgeInstall)?.join(
+                        &format!("net/neoforged/forge/{version}/forge-{version}-installer.jar"),
+                    )?
+                } else if source == SourceType::Official {
+                    get_download_api(source, ResourceType::NeoforgeInstall)?.join(&format!(
+                        "net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar"
+                    ))?
+                } else {
+                    get_download_api(source, ResourceType::NeoforgeInstall)?
+                        .join(&format!("{version}/download/installer"))?
+                }
             }
+            _ => return Err(LoaderInstallError::Unsupported(loader.to_string())),
+        };
+        if !sources.contains(&src) {
+            sources.push(src);
         }
-        _ => return Err(LoaderInstallError::Unsupported(loader.to_string())),
-    };
+    }
     let path = convert_library_name_to_path(&format!("{coordinate}:{version}-installer"), None)?;
     Ok(DownloadParam {
-        src,
+        sources,
         dest: library_dir.join(path),
         filename: None,
         sha1: None,
+        size: None,
     })
 }
 pub fn add_library_entry(
@@ -111,13 +122,14 @@ pub async fn prepare_libraries(
     target: &InstallTarget<'_>,
     client_info: &mut McClientInfo,
     platform: &RulePlatform,
-) -> Result<Vec<DownloadParam>> {
+) -> Result<(Vec<DownloadParam>, Vec<ProcessorsValue>)> {
     let source = *priority
         .first()
         .ok_or_else(|| LoaderInstallError::Network("no sources configured".into()))?;
     let root_dir = target.root_dir;
     let lib_dir = target.library_dir;
     let mut task_params = Vec::new();
+    let mut processors = Vec::new();
     let coordinate = family_coordinate(target.loader, target.loader_version)?;
     let installer_coord = format!("{coordinate}:{}-installer", target.loader_version);
     let installer_rel = convert_library_name_to_path(&installer_coord, None)?;
@@ -226,10 +238,15 @@ pub async fn prepare_libraries(
                     && let Some(client_mappings) = client_info.downloads.get("client_mappings")
                 {
                     task_params.push(DownloadParam {
-                        src: client_mappings.url.parse()?,
+                        sources: crate::resource::get_download_urls(
+                            &client_mappings.url.parse()?,
+                            &[],
+                            priority,
+                        )?,
                         dest: lib_dir.join(mojmaps),
                         filename: None,
                         sha1: Some(client_mappings.sha1.clone()),
+                        size: Some(client_mappings.size),
                     });
                 }
                 processor.args.clear();
@@ -269,10 +286,7 @@ pub async fn prepare_libraries(
                     .is_none_or(|sides| sides.iter().any(|side| side == "client"))
         });
 
-        fs::write(
-            target.version_dir.join("install_profile.json"),
-            &serde_json::to_vec_pretty(&profile)?,
-        )?;
+        processors = profile.processors;
 
         let forge_info: McClientInfo = serde_json::from_str(&version)?;
         client_info.main_class = forge_info.main_class.clone();
@@ -318,7 +332,7 @@ pub async fn prepare_libraries(
 
             let rel = convert_library_name_to_path(&name.to_string(), None)?;
             task_params.push(DownloadParam {
-                src: convert_url_to_target_source(
+                sources: crate::resource::get_download_urls(
                     &Url::parse(url)?,
                     &[
                         ResourceType::ForgeMaven,
@@ -327,11 +341,12 @@ pub async fn prepare_libraries(
                         ResourceType::CleanroomMaven,
                         ResourceType::Libraries,
                     ],
-                    &source,
+                    priority,
                 )?,
                 dest: lib_dir.join(&rel),
                 filename: None,
                 sha1: None,
+                size: None,
             });
         }
     } else {
@@ -384,11 +399,11 @@ pub async fn prepare_libraries(
 
             let url = match &lib.url {
                 Some(url) => Url::parse(url)?,
-                None => get_download_api(source, ResourceType::Libraries)?,
+                None => get_download_api(SourceType::Official, ResourceType::Libraries)?,
             };
 
             let rel = convert_library_name_to_path(&name, None)?;
-            let src = convert_url_to_target_source(
+            let sources = crate::resource::get_download_urls(
                 &url.join(&rel)?,
                 &[
                     ResourceType::ForgeMaven,
@@ -397,13 +412,14 @@ pub async fn prepare_libraries(
                     ResourceType::CleanroomMaven,
                     ResourceType::Libraries,
                 ],
-                &source,
+                priority,
             )?;
             task_params.push(DownloadParam {
-                src,
+                sources,
                 dest: lib_dir.join(&rel),
                 filename: None,
                 sha1: None,
+                size: None,
             });
         }
         client_info.patches.push(new_patch);
@@ -446,7 +462,7 @@ pub async fn prepare_libraries(
     let mut seen = std::collections::HashSet::new();
     missing.retain(|param| seen.insert(param.dest.clone()));
 
-    Ok(missing)
+    Ok((missing, processors))
 }
 #[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -634,17 +650,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
-            .await
-            .unwrap();
+        let (downloads, _) =
+            prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+                .await
+                .unwrap();
         assert_eq!(client.libraries.len(), 3);
         assert_eq!(downloads.len(), 1);
         assert!(downloads[0].dest.ends_with("bridge-1-natives-linux.jar"));
         assert_eq!(downloads[0].sha1.as_deref(), Some(native_hash.as_str()));
         fs::write(&downloads[0].dest, native_bytes).unwrap();
-        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
-            .await
-            .unwrap();
+        let (downloads, _) =
+            prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+                .await
+                .unwrap();
         assert!(downloads.is_empty());
         assert_eq!(
             fs::read_to_string(cached).unwrap(),
@@ -652,9 +670,10 @@ mod tests {
         );
         let cached = libraries.join("test/bridge/1/bridge-1.jar");
         fs::write(&cached, "corrupt cached bytes").unwrap();
-        let downloads = prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
-            .await
-            .unwrap();
+        let (downloads, _) =
+            prepare_libraries(&[SourceType::Official], &target, &mut client, &platform)
+                .await
+                .unwrap();
         assert_eq!(downloads.len(), 1);
         assert_eq!(downloads[0].dest, cached);
         assert_eq!(downloads[0].sha1.as_deref(), Some(java_hash.as_str()));
@@ -757,7 +776,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let downloads = prepare_libraries(
+            let (downloads, processors) = prepare_libraries(
                 &[SourceType::Official],
                 &target,
                 &mut client,
@@ -771,13 +790,9 @@ mod tests {
                     .dest
                     .ends_with("test/mappings/1/mappings-1.jar")
             );
-            let processed: InstallProfile = serde_json::from_slice(
-                &fs::read(version_dir.join("install_profile.json")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(processed.processors.len(), 1);
-            assert_eq!(processed.processors[0].args[1], "client");
-            assert!(processed.processors[0].args[0].ends_with("test/input/1/input-1.jar"));
+            assert_eq!(processors.len(), 1);
+            assert_eq!(processors[0].args[1], "client");
+            assert!(processors[0].args[0].ends_with("test/input/1/input-1.jar"));
             assert_eq!(client.main_class.as_deref(), Some("loader.Main"));
             assert_eq!(
                 fs::read(libraries.join("test/embedded/1/embedded-1.jar")).unwrap(),

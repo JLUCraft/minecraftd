@@ -6,7 +6,7 @@ pub mod modrinth;
 pub mod presentation;
 pub use mirrors::{
     ResourceType, SourceType, convert_url_source_type, convert_url_to_target_source,
-    get_download_api,
+    get_download_api, get_download_urls,
 };
 use thiserror::Error;
 #[cfg(test)]

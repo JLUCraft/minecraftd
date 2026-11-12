@@ -85,17 +85,11 @@ impl ModpackManifest for ModrinthManifest {
         &self,
         instance_path: &Path,
     ) -> Result<Vec<DownloadTask>, ModpackError> {
-        Ok(self
-            .download_requests(instance_path)?
+        self.download_requests(instance_path)?
             .into_iter()
-            .map(|request| {
-                let mut task = DownloadTask::new(request.src.to_string(), request.dest);
-                if let Some(sha1) = request.sha1 {
-                    task = task.with_sha1(sha1);
-                }
-                task
-            })
-            .collect())
+            .map(DownloadTask::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ModpackError::Network(error.to_string()))
     }
 
     fn overrides_path(&self) -> String {
@@ -138,17 +132,20 @@ impl ModrinthManifest {
             {
                 return Err(ModpackError::Parse("invalid modpack file path".into()));
             }
-            let url = file
-                .downloads
-                .first()
-                .ok_or_else(|| ModpackError::Parse("missing download URL".into()))?;
+            if file.downloads.is_empty() {
+                return Err(ModpackError::Parse("missing download URL".into()));
+            }
             requests.push(crate::download::request::DownloadParam {
-                src: url
-                    .parse()
+                sources: file
+                    .downloads
+                    .iter()
+                    .map(|url| url.parse())
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(|error: url::ParseError| ModpackError::Parse(error.to_string()))?,
                 dest: instance_path.join(&file.path),
                 filename: None,
                 sha1: Some(file.hashes.sha1.clone()),
+                size: Some(file.file_size),
             });
         }
         Ok(requests)

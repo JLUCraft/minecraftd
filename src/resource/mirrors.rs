@@ -246,3 +246,26 @@ pub fn convert_url_to_target_source(
     // If no replacement occurred, return the original URL
     Ok(url.clone())
 }
+
+/// Ordered unique sources for a download, including the supplied URL.
+pub fn get_download_urls(
+    url: &Url,
+    resource_types: &[ResourceType],
+    priority: &[SourceType],
+) -> MirrorResult<Vec<Url>> {
+    let sources = priority
+        .iter()
+        .copied()
+        .chain(SourceType::iter().filter(|source| !priority.contains(source)));
+    let mut urls = Vec::new();
+    for source in sources {
+        let candidate = convert_url_to_target_source(url, resource_types, &source)?;
+        if !urls.contains(&candidate) {
+            urls.push(candidate);
+        }
+    }
+    if !urls.contains(url) {
+        urls.push(url.clone());
+    }
+    Ok(urls)
+}

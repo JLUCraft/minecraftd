@@ -207,7 +207,8 @@ impl ModLoaderInstaller for OptiFineInstaller {
             &mut profile,
         )?;
         for request in downloads {
-            DownloadTask::new(request.src.to_string(), request.dest)
+            DownloadTask::try_from(request)
+                .map_err(|error| LoaderInstallError::Network(error.to_string()))?
                 .execute()
                 .await
                 .map_err(|error| LoaderInstallError::Network(error.to_string()))?;
@@ -242,10 +243,11 @@ pub fn installer_download(
         optifine.filename
     );
     Ok(DownloadParam {
-        src,
+        sources: vec![src],
         dest: library_dir.join(convert_library_name_to_path(&coordinate, None)?),
         filename: None,
         sha1: None,
+        size: None,
     })
 }
 pub fn prepare_libraries(
@@ -284,10 +286,11 @@ pub fn prepare_libraries(
         convert_url_to_target_source(&base.join(&lw_rel)?, &[ResourceType::Libraries], &source)?;
 
     task_params.push(DownloadParam {
-        src,
+        sources: vec![src],
         dest: lw_dest,
         filename: None,
         sha1: None,
+        size: None,
     });
 
     if !has_launchwrapper {

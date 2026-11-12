@@ -187,10 +187,20 @@ pub fn from_metadata(
             ..Default::default()
         });
         plan.downloads.push(DownloadParam {
-            src,
+            sources: crate::resource::get_download_urls(
+                &url,
+                &[
+                    ResourceType::QuiltMaven,
+                    ResourceType::FabricMaven,
+                    ResourceType::Libraries,
+                ],
+                &[source],
+            )
+            .map_err(parse_error)?,
             dest: library_dir.join(path),
             filename: None,
             sha1: sha1.map(str::to_owned),
+            size: (size != 0).then_some(size),
         });
     }
     Ok(plan)
@@ -213,15 +223,9 @@ pub async fn install(
     let tasks = plan
         .downloads
         .into_iter()
-        .map(|request| {
-            let mut task =
-                crate::download::task::DownloadTask::new(request.src.to_string(), request.dest);
-            if let Some(sha1) = request.sha1 {
-                task = task.with_sha1(sha1);
-            }
-            task
-        })
-        .collect();
+        .map(crate::download::task::DownloadTask::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LoaderInstallError::Network(error.to_string()))?;
     crate::download::queue::DownloadQueue::new(8)
         .download_all(tasks)
         .await
@@ -264,7 +268,7 @@ mod tests {
         assert!(
             plan.downloads
                 .iter()
-                .all(|request| request.src.host_str() == Some("bmclapi2.bangbang93.com"))
+                .all(|request| request.sources[0].host_str() == Some("bmclapi2.bangbang93.com"))
         );
         let mut profile = McClientInfo::default();
         plan.apply(&mut profile);

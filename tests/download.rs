@@ -104,7 +104,7 @@ async fn test_detect_and_parse_modrinth_modpack() {
             "path": "mods/fabric-api.jar",
             "hashes": { "sha1": "abc123", "sha512": "def456" },
             "env": { "client": "required", "server": "required" },
-            "downloads": ["https://example.com/mod.jar"],
+            "downloads": ["https://example.com/mod.jar", "https://mirror.example.com/mod.jar"],
             "fileSize": 1024
         }],
         "dependencies": {
@@ -137,6 +137,25 @@ async fn test_detect_and_parse_modrinth_modpack() {
     assert_eq!(manifest.overrides_path(), "overrides");
     assert_eq!(manifest.files.len(), 1);
     assert_eq!(manifest.files[0].path, "mods/fabric-api.jar");
+    let requests = manifest.download_requests(tmpdir.path()).unwrap();
+    assert_eq!(requests[0].size, Some(1024));
+    let tasks = manifest.download_tasks(tmpdir.path()).await.unwrap();
+    assert_eq!(
+        tasks[0].destination,
+        tmpdir.path().join("mods/fabric-api.jar")
+    );
+    let urls: Vec<_> = tasks[0]
+        .sources
+        .iter()
+        .map(|source| source.rewrite_url(&tasks[0].url))
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            "https://example.com/mod.jar",
+            "https://mirror.example.com/mod.jar"
+        ]
+    );
 }
 
 #[tokio::test]

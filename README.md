@@ -6,6 +6,8 @@ A composable Rust library for Minecraft instance management, downloads, mod load
 
 Public APIs live under `src/`; integration tests live under `tests/`. Sibling `federated-server` and `FollyLauncher` consume this library through path dependencies.
 
+Download plans use `download::request::DownloadParam` for ordered source URLs, destination, integrity metadata, and optional file size. Loader preparation returns bound processor steps with its downloads so the host can persist and execute the installation plan. Resource source selection is defined in `resource::mirrors`.
+
 `OutputRingBuffer::recent_with_offset` and `InstanceService::recent_output_with_offset` return a window's zero-based global first-line index and its lines. The index counts all written lines, including evicted lines, and is shared by buffer clones. Empty windows return the next write index. Clearing the buffer preserves the counter; a new buffer starts at zero. Existing line-only queries remain available.
 
 ## Validation
