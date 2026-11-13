@@ -1,4 +1,4 @@
-//! Shared client-side Forge, NeoForge and Cleanroom installer processing.
+//! Shared Forge, NeoForge and Cleanroom installer processing.
 use crate::download::request::DownloadParam;
 use crate::minecraft::dependencies::{convert_library_name_to_path, merge_library_lists};
 use crate::minecraft::loader::installer::LoaderInstallError;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use url::Url;
 use zip::ZipArchive;
 type Result<T> = std::result::Result<T, LoaderInstallError>;
@@ -104,6 +104,93 @@ pub fn installer_download(
         size: None,
     })
 }
+pub(crate) async fn install_server(
+    java: &Path,
+    installer: &Path,
+    game_dir: &Path,
+    loader: ModLoaderType,
+    minecraft: &str,
+    loader_version: &str,
+) -> Result<()> {
+    let root = fs::canonicalize(game_dir)?;
+    let libraries = root.join("libraries");
+    let coordinate = family_coordinate(loader, loader_version)?;
+    let cached = libraries.join(convert_library_name_to_path(
+        &format!("{coordinate}:{loader_version}-installer"),
+        None,
+    )?);
+    if let Some(parent) = cached.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(installer, &cached)?;
+    let manifest = crate::minecraft::manifest::VersionManifestClient::new();
+    let version = manifest
+        .find_version(minecraft)
+        .await
+        .map_err(|e| LoaderInstallError::Network(e.to_string()))?
+        .ok_or_else(|| LoaderInstallError::VersionNotFound(minecraft.into()))?;
+    let mut info = manifest
+        .download_version_json(&version)
+        .await
+        .map_err(|e| LoaderInstallError::Network(e.to_string()))?;
+    let target = InstallTarget {
+        loader,
+        loader_version,
+        name: minecraft,
+        version_dir: &root,
+        root_dir: &root,
+        library_dir: &libraries,
+    };
+    let (downloads, processors) = prepare_side(
+        &[SourceType::Official],
+        &target,
+        &mut info,
+        &RulePlatform::default(),
+        InstallSide::Server,
+    )
+    .await?;
+    let tasks = downloads
+        .into_iter()
+        .map(crate::download::task::DownloadTask::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| LoaderInstallError::Network(e.to_string()))?;
+    crate::download::queue::DownloadQueue::default()
+        .download_all(tasks)
+        .await
+        .map_err(|e| LoaderInstallError::Network(e.to_string()))?;
+    execute_processors(
+        java,
+        &root,
+        &InstallProfile {
+            processors,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn downloadable_libraries(
+    source: SourceType,
+    directory: &Path,
+    profile: &McClientInfo,
+    platform: &RulePlatform,
+) -> Result<Vec<DownloadParam>> {
+    let mut downloads = profile.clone();
+    // Empty download URLs mark artifacts produced by the installer.
+    downloads.libraries.retain(|library| {
+        library
+            .downloads
+            .as_ref()
+            .and_then(|value| value.artifact.as_ref())
+            .is_none_or(|artifact| !artifact.url.is_empty())
+    });
+    Ok(
+        crate::minecraft::dependencies::download_plan(
+            source, directory, &downloads, platform, true,
+        )
+        .await?,
+    )
+}
 pub fn add_library_entry(
     libraries: &mut Vec<LibrariesValue>,
     name: &str,
@@ -117,11 +204,33 @@ pub fn add_library_entry(
     *libraries = merge_library_lists(libraries, &[library]);
     Ok(())
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallSide {
+    Client,
+    Server,
+}
+impl InstallSide {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
 pub async fn prepare_libraries(
     priority: &[SourceType],
     target: &InstallTarget<'_>,
     client_info: &mut McClientInfo,
     platform: &RulePlatform,
+) -> Result<(Vec<DownloadParam>, Vec<ProcessorsValue>)> {
+    prepare_side(priority, target, client_info, platform, InstallSide::Client).await
+}
+async fn prepare_side(
+    priority: &[SourceType],
+    target: &InstallTarget<'_>,
+    client_info: &mut McClientInfo,
+    platform: &RulePlatform,
+    side: InstallSide,
 ) -> Result<(Vec<DownloadParam>, Vec<ProcessorsValue>)> {
     let source = *priority
         .first()
@@ -135,7 +244,11 @@ pub async fn prepare_libraries(
     let installer_rel = convert_library_name_to_path(&installer_coord, None)?;
     let installer_path = lib_dir.join(&installer_rel);
     let bin_patch = lib_dir.join(convert_library_name_to_path(
-        &format!("{coordinate}:{}:clientdata@lzma", target.loader_version),
+        &format!(
+            "{coordinate}:{}:{}data@lzma",
+            target.loader_version,
+            side.name()
+        ),
         None,
     )?);
     if !installer_path.exists() {
@@ -158,7 +271,7 @@ pub async fn prepare_libraries(
                 .strip_prefix("maven/")
                 .map_err(|error| LoaderInstallError::Parse(error.to_string()))?;
             lib_dir.join(relative_path)
-        } else if path == *"data/client.lzma" {
+        } else if path == Path::new(&format!("data/{}.lzma", side.name())) {
             bin_patch.clone()
         } else {
             continue;
@@ -200,42 +313,109 @@ pub async fn prepare_libraries(
         // It's modern version Forge installer
 
         let mut profile: InstallProfile = serde_json::from_str(&install_profile)?;
+        if side == InstallSide::Server
+            && let Some(coordinate) = &profile.path
+        {
+            let relative = convert_library_name_to_path(coordinate, None)?;
+            let filename = Path::new(&relative).file_name().ok_or_else(|| {
+                LoaderInstallError::Parse("server executable filename missing".into())
+            })?;
+            fs::copy(lib_dir.join(&relative), root_dir.join(filename))?;
+        }
 
+        let minecraft_jar = if side == InstallSide::Server {
+            if profile.minecraft != client_info.id {
+                return Err(LoaderInstallError::Parse(
+                    "installer Minecraft version differs from requested version".into(),
+                ));
+            }
+            let path = profile
+                .server_jar_path
+                .as_deref()
+                .unwrap_or("{ROOT}/minecraft_server.{MINECRAFT_VERSION}.jar")
+                .replace("{ROOT}", &root_dir.to_string_lossy())
+                .replace("{LIBRARY_DIR}", &lib_dir.to_string_lossy())
+                .replace("{MINECRAFT_VERSION}", &profile.minecraft);
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root_dir.join(path)
+            };
+            if !path.starts_with(root_dir)
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(LoaderInstallError::Parse(
+                    "server JAR path leaves game directory".into(),
+                ));
+            }
+            let server = client_info.downloads.get("server").ok_or_else(|| {
+                LoaderInstallError::Parse("Minecraft server download missing".into())
+            })?;
+            task_params.push(DownloadParam {
+                sources: vec![server.url.parse()?],
+                dest: path.clone(),
+                filename: None,
+                sha1: Some(server.sha1.clone()),
+                size: Some(server.size),
+            });
+            path
+        } else {
+            target.version_dir.join(format!("{}.jar", target.name))
+        };
         let mut args_map = HashMap::<String, String>::new();
         args_map.insert(
             "{MINECRAFT_JAR}".into(),
-            target
-                .version_dir
-                .join(format!("{}.jar", target.name))
-                .to_string_lossy()
-                .to_string(),
+            minecraft_jar.to_string_lossy().into_owned(),
         );
         args_map.insert("{BINPATCH}".into(), bin_patch.to_string_lossy().to_string());
         args_map.insert(
             "{INSTALLER}".into(),
             installer_path.to_string_lossy().to_string(),
         );
-        args_map.insert("{SIDE}".into(), "client".to_string());
+        args_map.insert("{SIDE}".into(), side.name().to_string());
+        args_map.insert(
+            "{LIBRARY_DIR}".into(),
+            lib_dir.to_string_lossy().into_owned(),
+        );
+        args_map.insert("{MINECRAFT_VERSION}".into(), profile.minecraft.clone());
         args_map.insert("{ROOT}".into(), root_dir.to_string_lossy().to_string());
         for (key, value) in profile.data.iter() {
             if args_map.contains_key(&format!("{{{key}}}")) {
                 continue;
             }
-            let value_client = if let Some(library) = value.client.strip_circumfix('[', ']') {
+            let value = match side {
+                InstallSide::Client => &value.client,
+                InstallSide::Server => &value.server,
+            };
+            let value_client = if let Some(library) = value.strip_circumfix('[', ']') {
                 lib_dir
                     .join(convert_library_name_to_path(library, None)?)
                     .to_string_lossy()
                     .into_owned()
             } else {
-                value.client.clone()
+                value
+                    .strip_circumfix('\'', '\'')
+                    .unwrap_or(value)
+                    .to_owned()
             };
             args_map.insert(format!("{{{key}}}"), value_client);
         }
 
+        profile.processors.retain(|processor| {
+            processor
+                .sides
+                .as_ref()
+                .is_none_or(|sides| sides.iter().any(|value| value == side.name()))
+        });
         for processor in profile.processors.iter_mut() {
             if processor.args.contains(&"DOWNLOAD_MOJMAPS".to_string()) {
                 if let Some(mojmaps) = args_map.get("{MOJMAPS}")
-                    && let Some(client_mappings) = client_info.downloads.get("client_mappings")
+                    && let Some(client_mappings) = client_info
+                        .downloads
+                        .get(&format!("{}_mappings", side.name()))
                 {
                     task_params.push(DownloadParam {
                         sources: crate::resource::get_download_urls(
@@ -248,6 +428,11 @@ pub async fn prepare_libraries(
                         sha1: Some(client_mappings.sha1.clone()),
                         size: Some(client_mappings.size),
                     });
+                } else {
+                    return Err(LoaderInstallError::Parse(format!(
+                        "{} mappings missing from installation metadata",
+                        side.name()
+                    )));
                 }
                 processor.args.clear();
                 continue;
@@ -278,45 +463,46 @@ pub async fn prepare_libraries(
             }
         }
 
-        profile.processors.retain(|processor| {
-            !processor.args.is_empty()
-                && processor
-                    .sides
-                    .as_ref()
-                    .is_none_or(|sides| sides.iter().any(|side| side == "client"))
-        });
+        profile
+            .processors
+            .retain(|processor| !processor.args.is_empty());
 
         processors = profile.processors;
 
-        let forge_info: McClientInfo = serde_json::from_str(&version)?;
-        client_info.main_class = forge_info.main_class.clone();
-
-        let mut loader_libraries = vec![];
-        for lib in forge_info.libraries.iter() {
-            let name = &lib.name;
-            add_library_entry(&mut client_info.libraries, name, Some(lib.clone()))?;
-            add_library_entry(&mut loader_libraries, name, Some(lib.clone()))?;
+        if side == InstallSide::Server {
+            let runtime: McClientInfo = serde_json::from_str(&version)?;
+            task_params.extend(downloadable_libraries(source, lib_dir, &runtime, platform).await?);
         }
+        if side == InstallSide::Client {
+            let forge_info: McClientInfo = serde_json::from_str(&version)?;
+            client_info.main_class = forge_info.main_class.clone();
 
-        let arguments = forge_info.arguments.clone();
-        let minecraft_arguments = if arguments.is_some() {
-            None
-        } else {
-            forge_info.minecraft_arguments.clone()
-        };
+            let mut loader_libraries = vec![];
+            for lib in forge_info.libraries.iter() {
+                let name = &lib.name;
+                add_library_entry(&mut client_info.libraries, name, Some(lib.clone()))?;
+                add_library_entry(&mut loader_libraries, name, Some(lib.clone()))?;
+            }
 
-        client_info.patches.push(McClientInfo {
-            id: target.loader.to_string().to_lowercase(),
-            version: Some(target.loader_version.to_owned()),
-            priority: Some(LOADER_PATCH_PRIORITY),
-            inherits_from: forge_info.inherits_from.clone(),
-            main_class: forge_info.main_class.clone(),
-            arguments,
-            minecraft_arguments,
-            libraries: loader_libraries,
-            ..Default::default()
-        });
+            let arguments = forge_info.arguments.clone();
+            let minecraft_arguments = if arguments.is_some() {
+                None
+            } else {
+                forge_info.minecraft_arguments.clone()
+            };
 
+            client_info.patches.push(McClientInfo {
+                id: target.loader.to_string().to_lowercase(),
+                version: Some(target.loader_version.to_owned()),
+                priority: Some(LOADER_PATCH_PRIORITY),
+                inherits_from: forge_info.inherits_from.clone(),
+                main_class: forge_info.main_class.clone(),
+                arguments,
+                minecraft_arguments,
+                libraries: loader_libraries,
+                ..Default::default()
+            });
+        }
         for lib in profile.libraries.iter() {
             let name = &lib.name;
             let url = lib
@@ -425,13 +611,11 @@ pub async fn prepare_libraries(
         client_info.patches.push(new_patch);
     }
 
-    reset_fields_from_patches(client_info);
+    if side == InstallSide::Client {
+        reset_fields_from_patches(client_info);
 
-    task_params.extend(
-        crate::minecraft::dependencies::download_plan(source, lib_dir, client_info, platform, true)
-            .await?,
-    );
-
+        task_params.extend(downloadable_libraries(source, lib_dir, client_info, platform).await?);
+    }
     let mut missing = Vec::new();
     for request in task_params {
         let cached = match fs::metadata(&request.dest) {
@@ -488,6 +672,7 @@ pub struct InstallProfile {
     pub profile: String,
     pub version: String,
     pub path: Option<String>,
+    pub server_jar_path: Option<String>,
     pub minecraft: String,
     pub data: HashMap<String, InstallProfileData>,
     pub processors: Vec<ProcessorsValue>,

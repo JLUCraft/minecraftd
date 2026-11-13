@@ -104,39 +104,6 @@ pub async fn find_java_executable() -> Result<std::path::PathBuf, LoaderInstallE
     ))
 }
 
-/// Runs a Java jar installer and verifies it produced the expected output.
-///
-/// This is a shared helper used by Forge and `NeoForge` installers.
-/// It is extracted so it can be unit-tested with a fake Java binary.
-pub async fn run_installer_jar(
-    java_path: &std::path::Path,
-    installer_jar: &std::path::Path,
-    game_dir: &std::path::Path,
-) -> Result<(), LoaderInstallError> {
-    let output = tokio::process::Command::new(java_path)
-        .arg("-jar")
-        .arg(installer_jar)
-        .arg("--installServer")
-        .arg(game_dir)
-        .current_dir(game_dir)
-        .output()
-        .await
-        .map_err(|e| LoaderInstallError::InstallFailed(format!("failed to run installer: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(LoaderInstallError::InstallFailed(format!(
-            "installer exited with code {:?}. stdout: {} stderr: {}",
-            output.status.code(),
-            stdout,
-            stderr
-        )));
-    }
-
-    Ok(())
-}
-
 /// Trait for mod loader installers.
 #[async_trait::async_trait]
 pub trait ModLoaderInstaller: Send + Sync {

@@ -1,6 +1,6 @@
 use crate::download::task::DownloadTask;
 use crate::minecraft::loader::installer::{
-    LoaderInstallError, ModLoaderInstaller, find_java_executable, run_installer_jar,
+    LoaderInstallError, ModLoaderInstaller, find_java_executable,
 };
 use crate::minecraft::loaders::ModLoaderType;
 use crate::minecraft::version::VersionInfo;
@@ -111,7 +111,15 @@ impl ModLoaderInstaller for NeoForgeInstaller {
         debug!("using Java executable: {}", java_path.display());
 
         // Run the installer
-        run_installer_jar(&java_path, &installer_jar, game_dir).await?;
+        crate::minecraft::loader::processors::install_server(
+            &java_path,
+            &installer_jar,
+            game_dir,
+            ModLoaderType::NeoForge,
+            mc_version,
+            loader_version,
+        )
+        .await?;
 
         debug!("NeoForge installer completed successfully");
 
@@ -119,7 +127,7 @@ impl ModLoaderInstaller for NeoForgeInstaller {
         let version_info = Self::extract_version_json_from_jar(&installer_jar)?;
 
         // Clean up installer jar
-        let _ = tokio::fs::remove_file(&installer_jar).await;
+        tokio::fs::remove_file(&installer_jar).await?;
 
         Ok(version_info)
     }
@@ -128,8 +136,6 @@ impl ModLoaderInstaller for NeoForgeInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::minecraft::loader::installer::run_installer_jar;
     use std::io::Write;
 
     #[test]
@@ -171,48 +177,5 @@ mod tests {
         let version_info = NeoForgeInstaller::extract_version_json_from_jar(&jar_path).unwrap();
         assert_eq!(version_info.id, "neoforge-20.4.0");
         assert_eq!(version_info.inherits_from, Some("1.20.4".to_string()));
-    }
-
-    /// Tests the full install flow using a fake Java binary.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_neoforge_install_with_fake_java() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let game_dir = tmpdir.path().join("game");
-        std::fs::create_dir_all(&game_dir).unwrap();
-
-        // Create a fake installer jar WITH embedded version.json
-        let installer_jar = game_dir.join("neoforge-1.20.4-20.4.0-installer.jar");
-        {
-            let file = std::fs::File::create(&installer_jar).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file("version.json", options).unwrap();
-            zip.write_all(br#"{"id":"neoforge-20.4.0","type":"release","mainClass":"net.neoforged.neoforge.launcher.Main","libraries":[],"inheritsFrom":"1.20.4"}"#).unwrap();
-            zip.finish().unwrap();
-        }
-
-        // Create a fake Java binary that just exits 0
-        let fake_java = tmpdir.path().join("fake-java");
-        std::fs::write(&fake_java, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake_java).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_java, perms).unwrap();
-        }
-
-        let result = run_installer_jar(&fake_java, &installer_jar, &game_dir).await;
-        assert!(result.is_ok(), "fake installer should succeed: {result:?}");
-
-        let version_info =
-            NeoForgeInstaller::extract_version_json_from_jar(&installer_jar).unwrap();
-        assert_eq!(version_info.id, "neoforge-20.4.0");
-        assert_eq!(
-            version_info.main_class,
-            Some("net.neoforged.neoforge.launcher.Main".to_string())
-        );
     }
 }

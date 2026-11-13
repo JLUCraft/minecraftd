@@ -1,6 +1,6 @@
 use crate::download::task::DownloadTask;
 use crate::minecraft::loader::installer::{
-    LoaderInstallError, ModLoaderInstaller, find_java_executable, run_installer_jar,
+    LoaderInstallError, ModLoaderInstaller, find_java_executable,
 };
 use crate::minecraft::loaders::ModLoaderType;
 use crate::minecraft::version::VersionInfo;
@@ -91,15 +91,23 @@ impl ModLoaderInstaller for ForgeInstaller {
         debug!("using Java executable: {}", java_path.display());
 
         // Run the installer
-        run_installer_jar(&java_path, &installer_jar, game_dir).await?;
+        crate::minecraft::loader::processors::install_server(
+            &java_path,
+            &installer_jar,
+            game_dir,
+            ModLoaderType::Forge,
+            mc_version,
+            loader_version,
+        )
+        .await?;
 
         debug!("Forge installer completed successfully");
 
         // Extract version info from the installer jar (server installer doesn't create versions/)
         let version_info = Self::extract_version_json_from_jar(&installer_jar)?;
 
-        // Clean up installer jar (optional, but keeps game dir clean)
-        let _ = tokio::fs::remove_file(&installer_jar).await;
+        // Remove the downloaded installer after successful installation.
+        tokio::fs::remove_file(&installer_jar).await?;
 
         Ok(version_info)
     }
@@ -108,8 +116,6 @@ impl ModLoaderInstaller for ForgeInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::minecraft::loader::installer::run_installer_jar;
     use std::io::Write;
 
     #[test]
@@ -127,23 +133,19 @@ mod tests {
     /// Tests extracting version.json from a real Forge installer jar.
     /// This test downloads a small installer jar, so it requires network.
     #[tokio::test]
-    async fn test_forge_extract_version_json_from_jar() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let jar_path = tmpdir.path().join("forge-installer.jar");
-
-        // Download a real Forge installer
-        let url = ForgeInstaller::installer_url("1.20.1", "47.2.0");
-        let task = DownloadTask::new(url.clone(), jar_path.clone());
-        let download_result = task.execute().await;
-        if download_result.is_err() {
-            eprintln!("SKIP: network unavailable");
-            return;
-        }
-
-        let version_info = ForgeInstaller::extract_version_json_from_jar(&jar_path).unwrap();
-        assert_eq!(version_info.id, "1.20.1-forge-47.2.0");
-        assert_eq!(version_info.inherits_from, Some("1.20.1".to_string()));
-        assert!(!version_info.main_class.as_ref().unwrap().is_empty());
+    async fn test_forge_extract_version_json_from_jar() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let jar_path = directory.path().join("forge-installer.jar");
+        let task = DownloadTask::new(
+            ForgeInstaller::installer_url("1.20.1", "47.2.0"),
+            jar_path.clone(),
+        );
+        task.execute().await?;
+        let info = ForgeInstaller::extract_version_json_from_jar(&jar_path)?;
+        assert_eq!(info.id, "1.20.1-forge-47.2.0");
+        assert_eq!(info.inherits_from.as_deref(), Some("1.20.1"));
+        assert!(info.main_class.is_some_and(|name| !name.is_empty()));
+        Ok(())
     }
 
     /// Tests extracting version.json from a fake jar with embedded version.json.
@@ -188,77 +190,5 @@ mod tests {
         let result = ForgeInstaller::extract_version_json_from_jar(&jar_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("version.json"));
-    }
-
-    /// Tests the full install flow using a fake Java binary that simulates
-    /// the Forge installer. The version.json is extracted from the fake jar.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_forge_install_with_fake_java() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let game_dir = tmpdir.path().join("game");
-        std::fs::create_dir_all(&game_dir).unwrap();
-
-        // Create a fake installer jar WITH embedded version.json
-        let installer_jar = game_dir.join("forge-1.20.1-47.2.0-installer.jar");
-        {
-            let file = std::fs::File::create(&installer_jar).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file("version.json", options).unwrap();
-            zip.write_all(br#"{"id":"1.20.1-forge-47.2.0","type":"release","mainClass":"net.minecraft.launchwrapper.Launch","libraries":[],"inheritsFrom":"1.20.1"}"#).unwrap();
-            zip.finish().unwrap();
-        }
-
-        // Create a fake Java binary that just exits 0 (libraries are "already there")
-        let fake_java = tmpdir.path().join("fake-java");
-        std::fs::write(&fake_java, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake_java).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_java, perms).unwrap();
-        }
-
-        // Test run_installer_jar directly with the fake Java
-        let result = run_installer_jar(&fake_java, &installer_jar, &game_dir).await;
-        assert!(result.is_ok(), "fake installer should succeed: {result:?}");
-
-        // Extract version info from the jar
-        let version_info = ForgeInstaller::extract_version_json_from_jar(&installer_jar).unwrap();
-        assert_eq!(version_info.id, "1.20.1-forge-47.2.0");
-        assert_eq!(
-            version_info.main_class,
-            Some("net.minecraft.launchwrapper.Launch".to_string())
-        );
-    }
-
-    /// Tests that `run_installer_jar` correctly reports failure when Java exits non-zero.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_forge_installer_jar_failure() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let fake_java = tmpdir.path().join("fake-java-fail");
-        std::fs::write(&fake_java, "#!/bin/sh\necho 'out of memory' >&2\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake_java).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_java, perms).unwrap();
-        }
-
-        let installer_jar = tmpdir.path().join("installer.jar");
-        std::fs::write(&installer_jar, b"").unwrap();
-
-        let result = run_installer_jar(&fake_java, &installer_jar, tmpdir.path()).await;
-        assert!(result.is_err(), "should fail when Java exits non-zero");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("out of memory"),
-            "error should contain stderr: {err}"
-        );
     }
 }
