@@ -203,10 +203,6 @@ async fn test_download_and_verify_asset() {
 // Helper
 // ============================================================================
 
-fn skip_if_offline() -> bool {
-    std::net::ToSocketAddrs::to_socket_addrs(&("maven.minecraftforge.net", 443)).is_err()
-}
-
 /// Recursively count .jar files in a directory.
 fn count_jar_files(dir: &std::path::Path) -> usize {
     let mut count = 0;
@@ -229,82 +225,49 @@ fn count_jar_files(dir: &std::path::Path) -> usize {
 
 #[tokio::test]
 async fn test_forge_installer_downloads_and_extracts_version() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let installer = ForgeInstaller::new();
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("forge-server");
 
     let result = installer.install("1.20.1", "47.2.0", &game_dir).await;
 
-    if let Err(ref e) = result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("java") {
-            eprintln!("SKIP: no Java installation available");
-            return;
-        }
-    }
-
     let version_info = result.expect("Forge install should succeed with network and Java");
     assert!(!version_info.id.is_empty());
     assert!(version_info.id.contains("forge"));
     assert!(version_info.main_class.is_some());
     assert!(game_dir.join("libraries").exists());
+    assert!(
+        game_dir
+            .join("libraries/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-server.jar")
+            .is_file()
+    );
 }
 
 #[tokio::test]
 async fn test_neoforge_installer_downloads_and_extracts_version() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let installer = NeoForgeInstaller::new();
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("neoforge-server");
 
     let result = installer.install("1.20.4", "20.4.0-beta", &game_dir).await;
 
-    if let Err(ref e) = result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("java") {
-            eprintln!("SKIP: no Java installation available");
-            return;
-        }
-        if msg.contains("404") || msg.contains("not found") {
-            eprintln!("SKIP: NeoForge version no longer available");
-            return;
-        }
-    }
-
     let version_info = result.expect("NeoForge install should succeed");
     assert!(!version_info.id.is_empty());
     assert!(game_dir.join("libraries").exists());
+    assert!(
+        game_dir
+            .join("libraries/net/neoforged/neoforge/20.4.0-beta/neoforge-20.4.0-beta-server.jar")
+            .is_file()
+    );
 }
 
 #[tokio::test]
 async fn test_paper_installer_downloads_server_jar() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let installer = PaperInstaller::paper();
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("paper-server");
 
     let result = installer.install("1.20.4", "496", &game_dir).await;
-
-    if let Err(ref e) = result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("not found") || msg.contains("404") {
-            eprintln!("SKIP: Paper build may no longer be available");
-            return;
-        }
-    }
 
     let version_info = result.expect("Paper install should succeed");
     assert_eq!(version_info.id, "paper-1.20.4-496");
@@ -420,11 +383,6 @@ use minecraftd::process::local::LocalSpawner;
 /// This test requires network, Java, and takes ~60-180 seconds.
 #[tokio::test]
 async fn test_paper_server_with_plugin_end_to_end() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("paper-server");
     std::fs::create_dir_all(&game_dir).unwrap();
@@ -432,13 +390,6 @@ async fn test_paper_server_with_plugin_end_to_end() {
     // Step 1: Install Paper server
     let paper = PaperInstaller::paper();
     let paper_result = paper.install("1.20.4", "496", &game_dir).await;
-    if let Err(ref e) = paper_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("not found") || msg.contains("404") {
-            eprintln!("SKIP: Paper build unavailable");
-            return;
-        }
-    }
     let _version_info = paper_result.expect("Paper install should succeed");
 
     let jar_path = game_dir.join("paper-1.20.4-496.jar");
@@ -456,18 +407,16 @@ async fn test_paper_server_with_plugin_end_to_end() {
             Some("ViaVersion.jar"),
         )
         .await;
-    if let Err(ref e) = plugin_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("http") || msg.contains("download") {
-            eprintln!("SKIP: plugin download failed: {}", msg);
-            return;
-        }
-    }
     let plugin_path = plugin_result.expect("plugin install should succeed");
     assert!(plugin_path.exists(), "Plugin JAR should exist");
 
     // Step 3: Accept EULA
     std::fs::write(game_dir.join("eula.txt"), "eula=true\n").unwrap();
+    std::fs::write(
+        game_dir.join("server.properties"),
+        "server-ip=127.0.0.1\nserver-port=0\n",
+    )
+    .unwrap();
 
     // Step 4: Start server via minecraftd InstanceBuilder
     let mut server = InstanceBuilder::new("paper-test".to_string(), InstancePath::new(&game_dir))
@@ -507,10 +456,7 @@ async fn test_paper_server_with_plugin_end_to_end() {
         tokio::time::sleep(poll_interval).await;
         let binding = output.lock().unwrap();
         let current = String::from_utf8_lossy(&binding).to_string();
-        if current.contains("Done")
-            || current.contains("Starting org.bukkit.craftbukkit.Main")
-            || current.contains("Starting minecraft server")
-        {
+        if current.contains("Done (") || !server.is_running() {
             eprintln!("Paper server started in {:?}", started.elapsed());
             break current;
         }
@@ -524,16 +470,14 @@ async fn test_paper_server_with_plugin_end_to_end() {
         }
     };
 
-    assert!(
-        logs.contains("Paper")
-            || logs.contains("Starting org.bukkit.craftbukkit.Main")
-            || logs.contains("Starting minecraft server"),
-        "server log should contain startup messages, got: {}",
-        &logs[..logs.len().min(500)]
-    );
-
+    let ready = logs.contains("Done (") && server.is_running();
     // Step 5: Stop the server gracefully
     server.stop().await.expect("server should stop");
+    assert!(ready, "Paper did not initialize:\n{logs}");
+    assert!(
+        logs.contains("Enabling ViaVersion"),
+        "ViaVersion was not enabled:\n{logs}"
+    );
     assert!(
         !server.is_running(),
         "server should not be running after stop"
@@ -563,11 +507,6 @@ async fn test_paper_server_with_plugin_end_to_end() {
 /// This test requires network, Java, and takes ~90-180 seconds.
 #[tokio::test]
 async fn test_forge_server_with_mod_end_to_end() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("forge-server");
     std::fs::create_dir_all(&game_dir).unwrap();
@@ -575,13 +514,6 @@ async fn test_forge_server_with_mod_end_to_end() {
     // Step 1: Install Forge server
     let forge = ForgeInstaller::new();
     let forge_result = forge.install("1.21.1", "52.1.14", &game_dir).await;
-    if let Err(ref e) = forge_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("java") {
-            eprintln!("SKIP: no Java installation");
-            return;
-        }
-    }
     let _version_info = forge_result.expect("Forge install should succeed");
 
     // Find the run script or forge jar
@@ -597,19 +529,18 @@ async fn test_forge_server_with_mod_end_to_end() {
     let mod_result = addon
         .install_from_url(AddonType::Mod, mod_url, &game_dir, Some("jei.jar"))
         .await;
-    if let Err(ref e) = mod_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("http") || msg.contains("download") || msg.contains("access") {
-            eprintln!("SKIP: mod download failed: {}", msg);
-            return;
-        }
-    }
     let mod_path = mod_result.expect("mod install should succeed");
     assert!(mod_path.exists(), "Mod JAR should exist");
 
     // Step 3: Accept EULA
     std::fs::write(game_dir.join("eula.txt"), "eula=true\n").unwrap();
+    std::fs::write(
+        game_dir.join("server.properties"),
+        "server-ip=127.0.0.1\nserver-port=0\n",
+    )
+    .unwrap();
 
+    std::fs::write(game_dir.join("user_jvm_args.txt"), "-Xms128m\n-Xmx1G\n").unwrap();
     // Step 4: Start server via minecraftd InstanceBuilder
     // Forge uses run.sh script
     // Forge installs run.sh and run.bat; on Windows "bash" resolves to WSL.
@@ -651,8 +582,7 @@ async fn test_forge_server_with_mod_end_to_end() {
         tokio::time::sleep(poll_interval).await;
         let binding = output.lock().unwrap();
         let current = String::from_utf8_lossy(&binding).to_string();
-        let lower = current.to_lowercase();
-        if lower.contains("forge") || lower.contains("minecraftforge") || lower.contains("done") {
+        if current.contains("Done (") || !server.is_running() {
             eprintln!("Forge server started in {:?}", started.elapsed());
             break current;
         }
@@ -666,17 +596,10 @@ async fn test_forge_server_with_mod_end_to_end() {
         }
     };
 
-    let logs_lower = logs.to_lowercase();
-    assert!(
-        logs_lower.contains("forge")
-            || logs_lower.contains("minecraftforge")
-            || logs_lower.contains("loading"),
-        "server log should contain Forge startup messages, got: {}",
-        &logs[..logs.len().min(500)]
-    );
-
+    let ready = logs.contains("Done (") && server.is_running();
     // Step 5: Stop
     server.stop().await.expect("server should stop");
+    assert!(ready, "Forge did not initialize:\n{logs}");
     assert!(!server.is_running());
 }
 
@@ -691,11 +614,6 @@ async fn test_forge_server_with_mod_end_to_end() {
 /// Account and skin are left empty (offline mode).
 #[tokio::test]
 async fn test_fabric_client_with_mod_end_to_end() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("fabric-client");
     std::fs::create_dir_all(&game_dir).unwrap();
@@ -703,13 +621,6 @@ async fn test_fabric_client_with_mod_end_to_end() {
     // Step 1: Install Fabric loader
     let fabric = FabricInstaller::new();
     let fabric_result = fabric.install("1.20.4", "0.15.6", &game_dir).await;
-    if let Err(ref e) = fabric_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("network") || msg.contains("http") {
-            eprintln!("SKIP: Fabric install failed: {}", msg);
-            return;
-        }
-    }
     let version_info = fabric_result.expect("Fabric install should succeed");
     assert!(!version_info.id.is_empty());
     assert!(version_info.main_class.is_some());
@@ -759,13 +670,6 @@ async fn test_fabric_client_with_mod_end_to_end() {
     let mod_result = addon
         .install_from_url(AddonType::Mod, mod_url, &game_dir, Some("fabric-api.jar"))
         .await;
-    if let Err(ref e) = mod_result {
-        let msg = e.to_string().to_lowercase();
-        if msg.contains("http") || msg.contains("download") {
-            eprintln!("SKIP: mod download failed: {}", msg);
-            return;
-        }
-    }
     let mod_path = mod_result.expect("mod install should succeed");
     assert!(mod_path.exists(), "Mod JAR should exist");
     assert_eq!(

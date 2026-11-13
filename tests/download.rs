@@ -17,10 +17,6 @@ use std::path::PathBuf;
 // Helpers
 // ============================================================================
 
-fn skip_if_offline() -> bool {
-    std::net::ToSocketAddrs::to_socket_addrs(&("api.modrinth.com", 443)).is_err()
-}
-
 fn make_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
@@ -357,131 +353,138 @@ async fn test_modrinth_export_then_import() {
 // Modpack download tasks — `from_archive` → `download_tasks()` (network)
 // ============================================================================
 
-/// CurseForge modpack: parse zip → download_tasks → execute.
-/// Requires `MINECRAFTD_CURSEFORGE_API_KEY` env var.
-#[tokio::test]
-async fn test_curseforge_modpack_download_tasks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
+const CF_PROJECT_ID: u64 = 238222;
+const CF_FILE_ID: u64 = 5704646;
+const CF_KEY: &str = "fixture-key";
+const ARTIFACT_BYTES: &[u8] = b"downloaded artifact fixture";
+#[derive(Default)]
+struct CurseForgeFixture {
+    download_url: String,
+}
+fn cf_project(class: u32) -> serde_json::Value {
+    serde_json::json!({"id":CF_PROJECT_ID,"classId":class,"links":{"websiteUrl":"https://example.org/project"},"name":"Fixture","slug":"fixture","summary":"Resource fixture","categories":[],"downloadCount":1,"logo":null,"dateModified":"2026-11-13T00:00:00Z","authors":[]})
+}
+#[async_trait::async_trait]
+impl minecraftd::resource::http::ResourceTransport for CurseForgeFixture {
+    async fn request_json(
+        &self,
+        url: &str,
+        query: &std::collections::HashMap<String, String>,
+        body: Option<&serde_json::Value>,
+        api_key: Option<&str>,
+    ) -> Result<serde_json::Value, minecraftd::resource::ResourceError> {
+        use minecraftd::resource::ResourceError;
+        assert_eq!(api_key, Some(CF_KEY));
+        assert!(body.is_none());
+        let path = url::Url::parse(url)?.path().to_owned();
+        if path == format!("/v1/mods/{CF_PROJECT_ID}") {
+            return Ok(serde_json::json!({"data":cf_project(6)}));
+        }
+        if path == format!("/v1/mods/{CF_PROJECT_ID}/files/{CF_FILE_ID}") {
+            return Ok(
+                serde_json::json!({"data":{"id":CF_FILE_ID,"modId":CF_PROJECT_ID,"displayName":"Fixture","fileName":"fixture.jar","releaseType":1,"hashes":[],"fileDate":"2026-11-13T00:00:00Z","downloadUrl":self.download_url,"downloadCount":1,"gameVersions":["1.20.1"],"dependencies":[]}}),
+            );
+        }
+        if path == "/v1/mods/search" {
+            assert_eq!(query.get("gameId").map(String::as_str), Some("432"));
+            let class = query
+                .get("classId")
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| ResourceError::Parse("resource class required".into()))?;
+            return Ok(
+                serde_json::json!({"data":[cf_project(class)],"pagination":{"index":0,"pageSize":5,"totalCount":1}}),
+            );
+        }
+        Err(ResourceError::Api(format!(
+            "unexpected fixture request: {url}"
+        )))
     }
-    let api_key = std::env::var("MINECRAFTD_CURSEFORGE_API_KEY");
-    if api_key.is_err() {
-        eprintln!("SKIP: MINECRAFTD_CURSEFORGE_API_KEY not set");
-        return;
-    }
-
-    let tmpdir = tempfile::tempdir().unwrap();
-    let zip = zip_path(&tmpdir, "cf-download.zip");
-    let instance_path = tmpdir.path().join("instance");
-
-    // JEI for 1.20.1 Forge (project 238222, file 5704646)
-    let manifest_json = serde_json::json!({
-        "minecraft": {
-            "version": "1.20.1",
-            "modLoaders": [{ "id": "forge-47.2.0", "primary": true }]
-        },
-        "manifestType": "minecraftModpack",
-        "manifestVersion": 1,
-        "name": "CF Download Test",
-        "version": "1.0.0",
-        "author": "test",
-        "files": [
-            { "projectID": 238222, "fileID": 5704646, "required": true }
-        ],
-        "overrides": "overrides"
-    });
-    make_zip(
-        &zip,
-        &[("manifest.json", manifest_json.to_string().as_bytes())],
-    );
-
-    let manifest = CurseForgeManifest::from_archive(&zip).expect("should parse");
-    let tasks = manifest.download_tasks(&instance_path).await;
-
-    match tasks {
-        Ok(task_list) => {
-            assert!(!task_list.is_empty(), "should generate download tasks");
-            eprintln!("{} download task(s)", task_list.len());
-
-            if let Some(task) = task_list.first() {
-                eprintln!(
-                    "Downloading: {} -> {}",
-                    task.url,
-                    task.destination.display()
-                );
-                match task.execute().await {
-                    Ok(()) => {
-                        assert!(task.destination.exists());
-                        let meta = tokio::fs::metadata(&task.destination).await.unwrap();
-                        assert!(meta.len() > 1000, "mod JAR should have content");
-                        eprintln!("Downloaded {} bytes", meta.len());
-                    }
-                    Err(e) => eprintln!("Download failed (network): {}", e),
-                }
+}
+async fn artifact_server() -> std::io::Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)>
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/mod.jar", listener.local_addr()?);
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).await?;
+        assert_eq!(line, "GET /mod.jar HTTP/1.1\r\n");
+        loop {
+            line.clear();
+            if socket.read_line(&mut line).await? == 0 || line == "\r\n" {
+                break;
             }
         }
-        Err(e) => eprintln!("Task generation failed (network/api): {}", e),
+        socket
+            .get_mut()
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ARTIFACT_BYTES.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        socket.get_mut().write_all(ARTIFACT_BYTES).await?;
+        socket.get_mut().shutdown().await
+    });
+    Ok((url, task))
+}
+/// Parse an archive, resolve authenticated metadata, and write the downloaded mod.
+#[tokio::test]
+async fn test_curseforge_modpack_download_tasks() -> Result<(), Box<dyn std::error::Error>> {
+    let (download_url, server) = artifact_server().await?;
+    let client = CurseForgeClient::with_client(CurseForgeFixture { download_url }, CF_KEY.into());
+    let directory = tempfile::tempdir()?;
+    let zip = zip_path(&directory, "cf-download.zip");
+    let instance = directory.path().join("instance");
+    let manifest = serde_json::json!({"minecraft":{"version":"1.20.1","modLoaders":[{"id":"forge-47.2.0","primary":true}]},"manifestType":"minecraftModpack","manifestVersion":1,"name":"Fixture","version":"1.0.0","author":"Test","files":[{"projectID":CF_PROJECT_ID,"fileID":CF_FILE_ID,"required":true}],"overrides":"overrides"});
+    make_zip(&zip, &[("manifest.json", manifest.to_string().as_bytes())]);
+    let manifest = CurseForgeManifest::from_archive(&zip)?;
+    let requests = manifest.download_requests(&client, &instance).await?;
+    assert_eq!(requests.len(), 1);
+    for request in requests {
+        minecraftd::download::task::DownloadTask::try_from(request)?
+            .execute()
+            .await?;
     }
+    assert_eq!(
+        tokio::fs::read(instance.join("mods/fixture.jar")).await?,
+        ARTIFACT_BYTES
+    );
+    server.await??;
+    Ok(())
 }
 
 /// Modrinth modpack: parse zip → download_tasks → execute.
 #[tokio::test]
-async fn test_modrinth_modpack_download_tasks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
-    let tmpdir = tempfile::tempdir().unwrap();
-    let zip = zip_path(&tmpdir, "mr-download.zip");
-    let instance_path = tmpdir.path().join("instance");
-
-    // Fabric API from Modrinth CDN — no API key needed
-    let index_json = serde_json::json!({
-        "formatVersion": 1,
-        "game": "minecraft",
-        "versionId": "1.0.0",
-        "name": "MR Download Test",
-        "files": [{
-            "path": "mods/fabric-api.jar",
-            "hashes": { "sha1": "abc", "sha512": "def" },
-            "downloads": [
-                "https://cdn.modrinth.com/data/P7dR8mSH/versions/fabric-api-0.91.3%2B1.20.4.jar"
-            ],
-            "fileSize": 0
-        }],
-        "dependencies": { "minecraft": "1.20.4", "fabric-loader": "0.15.6" }
-    });
+async fn test_modrinth_modpack_download_tasks() -> Result<(), Box<dyn std::error::Error>> {
+    let (download_url, server) = artifact_server().await?;
+    let directory = tempfile::tempdir()?;
+    let zip = zip_path(&directory, "mr-download.zip");
+    let instance = directory.path().join("instance");
+    use sha1::Digest;
+    let payload_sha1 = hex::encode(sha1::Sha1::digest(ARTIFACT_BYTES));
+    let payload_sha512 = hex::encode(sha2::Sha512::digest(ARTIFACT_BYTES));
+    let index = serde_json::json!({"formatVersion":1,"game":"minecraft","versionId":"1.0.0","name":"Fixture","files":[{"path":"mods/fixture.jar","hashes":{"sha1":payload_sha1,"sha512":payload_sha512},"downloads":[download_url],"fileSize":ARTIFACT_BYTES.len()}],"dependencies":{"minecraft":"1.20.4","fabric-loader":"0.15.6"}});
     make_zip(
         &zip,
-        &[("modrinth.index.json", index_json.to_string().as_bytes())],
+        &[("modrinth.index.json", index.to_string().as_bytes())],
     );
-
-    let manifest =
-        minecraftd::modpack::modrinth::ModrinthManifest::from_archive(&zip).expect("should parse");
-    let tasks = manifest
-        .download_tasks(&instance_path)
-        .await
-        .expect("should generate download tasks");
-    assert!(!tasks.is_empty(), "should generate download tasks");
-
-    if let Some(task) = tasks.first() {
-        eprintln!(
-            "Downloading: {} -> {}",
-            task.url,
-            task.destination.display()
-        );
-        match task.execute().await {
-            Ok(()) => {
-                assert!(task.destination.exists());
-                let meta = tokio::fs::metadata(&task.destination).await.unwrap();
-                assert!(meta.len() > 10000, "mod JAR should have content");
-                eprintln!("Downloaded {} bytes", meta.len());
-            }
-            Err(e) => eprintln!("Download failed (network): {}", e),
-        }
+    let manifest = minecraftd::modpack::modrinth::ModrinthManifest::from_archive(&zip)?;
+    let tasks = manifest.download_tasks(&instance).await?;
+    assert_eq!(tasks.len(), 1);
+    for task in tasks {
+        task.execute().await?;
     }
+    assert_eq!(
+        tokio::fs::read(instance.join("mods/fixture.jar")).await?,
+        ARTIFACT_BYTES
+    );
+    server.await??;
+    Ok(())
 }
 
 // ============================================================================
@@ -490,11 +493,6 @@ async fn test_modrinth_modpack_download_tasks() {
 
 #[tokio::test]
 async fn test_plugin_install_from_url() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("server");
 
@@ -516,24 +514,12 @@ async fn test_plugin_install_from_url() {
             assert!(meta.len() > 1000);
             eprintln!("Plugin downloaded: {} bytes", meta.len());
         }
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("http") || msg.contains("download") || msg.contains("network") {
-                eprintln!("SKIP: plugin download failed (network): {}", e);
-            } else {
-                panic!("plugin download failed: {}", e);
-            }
-        }
+        Err(e) => panic!("plugin download failed: {e}"),
     }
 }
 
 #[tokio::test]
 async fn test_mod_install_from_url() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let tmpdir = tempfile::tempdir().unwrap();
     let game_dir = tmpdir.path().join("client");
 
@@ -541,7 +527,7 @@ async fn test_mod_install_from_url() {
     let result = installer
         .install_from_url(
             AddonType::Mod,
-            "https://cdn.modrinth.com/data/P7dR8mSH/versions/fabric-api-0.91.3%2B1.20.4.jar",
+            "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/0.91.3+1.20.4/fabric-api-0.91.3+1.20.4.jar",
             &game_dir,
             Some("fabric-api.jar"),
         )
@@ -555,14 +541,7 @@ async fn test_mod_install_from_url() {
             assert!(meta.len() > 10000);
             eprintln!("Mod downloaded: {} bytes", meta.len());
         }
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("http") || msg.contains("download") || msg.contains("network") {
-                eprintln!("SKIP: mod download failed (network): {}", e);
-            } else {
-                panic!("mod download failed: {}", e);
-            }
-        }
+        Err(e) => panic!("mod download failed: {e}"),
     }
 }
 
@@ -572,11 +551,6 @@ async fn test_mod_install_from_url() {
 
 #[tokio::test]
 async fn test_modrinth_search_resourcepacks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let client = ModrinthClient::new();
     let result = client
         .search_projects(&SearchQuery {
@@ -599,17 +573,12 @@ async fn test_modrinth_search_resourcepacks() {
                 assert_eq!(hit.project_type, "resourcepack");
             }
         }
-        Err(e) => eprintln!("Modrinth search failed (network): {}", e),
+        Err(e) => panic!("Modrinth search failed (network): {}", e),
     }
 }
 
 #[tokio::test]
 async fn test_modrinth_search_shaderpacks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-
     let client = ModrinthClient::new();
     let result = client
         .search_projects(&SearchQuery {
@@ -632,69 +601,37 @@ async fn test_modrinth_search_shaderpacks() {
                 assert_eq!(hit.project_type, "shader");
             }
         }
-        Err(e) => eprintln!("Modrinth search failed (network): {}", e),
+        Err(e) => panic!("Modrinth search failed (network): {}", e),
     }
 }
 
 #[tokio::test]
-async fn test_curseforge_search_resourcepacks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-    let api_key = std::env::var("MINECRAFTD_CURSEFORGE_API_KEY");
-    if api_key.is_err() {
-        eprintln!("SKIP: MINECRAFTD_CURSEFORGE_API_KEY not set");
-        return;
-    }
-
-    let client = CurseForgeClient::new(api_key.unwrap());
-    let query = SearchModsQuery {
-        class_id: Some(12), // Resource Packs
-        page_size: 5,
-        ..SearchModsQuery::new("")
-    };
-
-    match client.search_mods(&query).await {
-        Ok(result) => {
-            eprintln!(
-                "CurseForge resource pack search: {} mods / {} total",
-                result.data.len(),
-                result.pagination.total_count
-            );
-            assert!(!result.data.is_empty() || result.pagination.total_count > 0);
-        }
-        Err(e) => eprintln!("CurseForge search failed (network): {}", e),
-    }
+async fn test_curseforge_search_resourcepacks() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CurseForgeClient::with_client(CurseForgeFixture::default(), CF_KEY.into());
+    let result = client
+        .search_mods(&SearchModsQuery {
+            class_id: Some(12),
+            page_size: 5,
+            ..SearchModsQuery::new("")
+        })
+        .await?;
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].class_id, Some(12));
+    assert_eq!(result.pagination.total_count, 1);
+    Ok(())
 }
-
 #[tokio::test]
-async fn test_curseforge_search_shaderpacks() {
-    if skip_if_offline() {
-        eprintln!("SKIP: no network connectivity");
-        return;
-    }
-    let api_key = std::env::var("MINECRAFTD_CURSEFORGE_API_KEY");
-    if api_key.is_err() {
-        eprintln!("SKIP: MINECRAFTD_CURSEFORGE_API_KEY not set");
-        return;
-    }
-
-    let client = CurseForgeClient::new(api_key.unwrap());
-    let query = SearchModsQuery {
-        class_id: Some(6552), // Shader Packs
-        page_size: 5,
-        ..SearchModsQuery::new("")
-    };
-
-    match client.search_mods(&query).await {
-        Ok(result) => {
-            eprintln!(
-                "CurseForge shader search: {} mods / {} total",
-                result.data.len(),
-                result.pagination.total_count
-            );
-        }
-        Err(e) => eprintln!("CurseForge search failed (network): {}", e),
-    }
+async fn test_curseforge_search_shaderpacks() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CurseForgeClient::with_client(CurseForgeFixture::default(), CF_KEY.into());
+    let result = client
+        .search_mods(&SearchModsQuery {
+            class_id: Some(6552),
+            page_size: 5,
+            ..SearchModsQuery::new("")
+        })
+        .await?;
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].class_id, Some(6552));
+    assert_eq!(result.pagination.total_count, 1);
+    Ok(())
 }

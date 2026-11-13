@@ -23,4 +23,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
+Installer and live download integration tests require network access and Java 21.
+Missing prerequisites and API/download failures fail the tests. CurseForge tests
+use the existing resource transport with local fixtures and require no API key.
+
 Read [AGENTS.md](AGENTS.md) before making changes.
