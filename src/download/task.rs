@@ -79,7 +79,7 @@ impl TryFrom<crate::download::request::DownloadParam> for DownloadTask {
                 .into_iter()
                 .map(|url| DownloadSource::Direct(url.to_string()))
                 .collect(),
-            retry_config: None,
+            retry_config: Some(RetryConfig::default()),
         })
     }
 }
@@ -93,7 +93,7 @@ impl DownloadTask {
             destination,
             expected_sha1: None,
             sources: vec![DownloadSource::Official],
-            retry_config: None,
+            retry_config: Some(RetryConfig::default()),
         }
     }
 
@@ -149,6 +149,7 @@ impl DownloadTask {
         }
 
         let mut last_error = None;
+        let mut failures = Vec::new();
         for source in &self.sources {
             let url = source.rewrite_url(&self.url);
             debug!("downloading from: {}", url);
@@ -160,16 +161,15 @@ impl DownloadTask {
                 }
                 Err(e) => {
                     warn!("source failed ({}): {}", url, e);
+                    failures.push(format!("{url}: {e}"));
                     last_error = Some(e);
                 }
             }
         }
-
-        if let Some(err @ DownloadError::RetryExhausted { .. }) = last_error {
-            return Err(err);
+        if failures.len() > 1 {
+            return Err(DownloadError::Network(failures.join("; ")));
         }
-
-        Err(DownloadError::AllSourcesFailed)
+        Err(last_error.unwrap_or(DownloadError::AllSourcesFailed))
     }
 
     async fn download_from(&self, url: &str) -> Result<(), DownloadError> {
@@ -225,7 +225,8 @@ impl DownloadTask {
 
         let status = response.status();
         if !status.is_success() {
-            let retryable = status.is_server_error();
+            let retryable =
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
             return Err((
                 DownloadError::Http {
                     status: status.as_u16(),
@@ -289,7 +290,7 @@ mod tests {
         assert_eq!(task.url, "https://example.com/file.jar");
         assert_eq!(task.destination, std::path::PathBuf::from("/tmp/file.jar"));
         assert_eq!(task.expected_sha1, Some("abc123".to_string()));
-        assert!(task.retry_config.is_none());
+        assert!(task.retry_config.is_some());
     }
 
     #[test]
@@ -347,8 +348,8 @@ mod tests {
 
         let result = task.execute().await;
         assert!(
-            matches!(result, Err(DownloadError::AllSourcesFailed)),
-            "expected AllSourcesFailed when every source is unreachable, got {result:?}"
+            matches!(result, Err(DownloadError::Network(_))),
+            "expected source transport errors when every source is unreachable, got {result:?}"
         );
     }
 

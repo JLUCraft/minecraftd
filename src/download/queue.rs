@@ -30,7 +30,7 @@ impl DownloadQueue {
     ///
     /// Returns `DownloadQueueError` if any task fails.
     pub async fn download_all(&self, tasks: Vec<DownloadTask>) -> Result<(), DownloadQueueError> {
-        let mut handles = Vec::new();
+        let mut handles = tokio::task::JoinSet::new();
 
         for task in tasks {
             let permit = self
@@ -40,27 +40,27 @@ impl DownloadQueue {
                 .await
                 .map_err(|e| DownloadQueueError::Download(e.to_string()))?;
 
-            let handle = tokio::spawn(async move {
+            handles.spawn(async move {
                 let _permit = permit;
                 debug!("starting download: {}", task.destination.display());
-                let result = task.execute().await;
+                let result = task.execute().await.map_err(|error| {
+                    DownloadQueueError::Download(format!("{}: {error}", task.url))
+                });
                 match &result {
                     Ok(()) => info!("completed: {}", task.destination.display()),
                     Err(e) => error!("failed: {}: {}", task.destination.display(), e),
                 }
                 result
             });
-
-            handles.push(handle);
         }
 
         let mut any_error = None;
-        for handle in handles {
-            match handle.await {
+        while let Some(result) = handles.join_next().await {
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if any_error.is_none() {
-                        any_error = Some(DownloadQueueError::Download(e.to_string()));
+                        any_error = Some(e);
                     }
                 }
                 Err(e) => {
