@@ -1,10 +1,24 @@
-use std::io::Write;
+use crate::archive::ArchiveError;
+use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-use tracing::{debug, trace};
-
-use crate::archive::ArchiveError;
+/// Resource limits shared by archive creation and extraction.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    /// Maximum input, output, and expanded bytes per archive.
+    pub bytes: u64,
+    /// Maximum number of entries, including directories.
+    pub entries: u64,
+}
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            bytes: 10 * 1024 * 1024 * 1024,
+            entries: 100_000,
+        }
+    }
+}
 
 /// Statistics gathered during archive creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,330 +31,470 @@ pub struct CompressionStats {
     pub compressed_size: u64,
 }
 
-/// Creates a compressed archive from selected paths within a source directory.
-///
-/// `include_paths` are relative to `source_dir`. Directories are walked recursively.
+struct Budget {
+    limits: ArchiveLimits,
+    bytes: u64,
+    entries: u64,
+    files: u64,
+}
+impl Budget {
+    const fn new(limits: ArchiveLimits) -> Self {
+        Self {
+            limits,
+            bytes: 0,
+            entries: 0,
+            files: 0,
+        }
+    }
+    fn entry(&mut self) -> Result<(), ArchiveError> {
+        self.entries = self.entries.checked_add(1).ok_or(ArchiveError::Quota)?;
+        if self.entries > self.limits.entries {
+            return Err(ArchiveError::Quota);
+        }
+        Ok(())
+    }
+    fn copy(&mut self, input: &mut impl Read, output: &mut impl Write) -> Result<(), ArchiveError> {
+        let remaining = self.limits.bytes.saturating_sub(self.bytes);
+        let written = std::io::copy(&mut input.take(remaining), output)?;
+        self.bytes += written;
+        let mut extra = [0u8; 1];
+        if input.read(&mut extra)? != 0 {
+            return Err(ArchiveError::Quota);
+        }
+        self.files += 1;
+        Ok(())
+    }
+}
+
+struct BoundedFile {
+    file: std::fs::File,
+    position: u64,
+    limit: u64,
+}
+impl BoundedFile {
+    fn create(path: &Path, limit: u64) -> Result<Self, ArchiveError> {
+        Ok(Self {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(path)?,
+            position: 0,
+            limit,
+        })
+    }
+}
+impl Write for BoundedFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = u64::try_from(bytes.len()).map_err(std::io::Error::other)?;
+        if length > self.limit.saturating_sub(self.position) {
+            return Err(std::io::Error::other("archive byte quota exceeded"));
+        }
+        let written = self.file.write(bytes)?;
+        self.position += written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+impl Seek for BoundedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let next = self.file.seek(position)?;
+        if next > self.limit {
+            return Err(std::io::Error::other("archive byte quota exceeded"));
+        }
+        self.position = next;
+        Ok(next)
+    }
+}
+
+fn relative_path(path: &Path) -> Result<(), ArchiveError> {
+    if path
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(ArchiveError::Compression(
+            "archive path escapes the instance directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sources(
+    source: &Path,
+    selected: &[PathBuf],
+    limits: ArchiveLimits,
+) -> Result<Vec<PathBuf>, ArchiveError> {
+    if !std::fs::symlink_metadata(source)?.is_dir() {
+        return Err(ArchiveError::Compression(
+            "archive source is not a directory".into(),
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for relative in selected {
+        relative_path(relative)?;
+        let mut root = source.to_path_buf();
+        for component in relative.components() {
+            if let Component::Normal(name) = component {
+                root.push(name);
+                let metadata = std::fs::symlink_metadata(&root)?;
+                if metadata.is_symlink() {
+                    return Err(ArchiveError::Compression(
+                        "archive source contains a link".into(),
+                    ));
+                }
+            }
+        }
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|error| ArchiveError::Io(error.to_string()))?;
+            let kind = entry.file_type();
+            if !kind.is_file() && !kind.is_dir() {
+                return Err(ArchiveError::Compression(
+                    "archive source contains a link or special file".into(),
+                ));
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|error| ArchiveError::Io(error.to_string()))?;
+            if relative == Path::new("") || relative == Path::new(".") {
+                continue;
+            }
+            relative_path(relative)?;
+            paths.insert(relative.to_path_buf());
+            if paths.len() as u64 > limits.entries {
+                return Err(ArchiveError::Quota);
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+pub(crate) fn open_regular(path: &Path) -> Result<std::fs::File, ArchiveError> {
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(ArchiveError::Compression(
+            "archive source is not a regular file".into(),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(ArchiveError::Compression(
+            "archive source is not a regular file".into(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Creates a bounded ZIP from controlled source paths. Links and special files are rejected.
 ///
 /// # Errors
-///
-/// Returns `ArchiveError` on I/O failures or compression errors.
+/// Returns an archive error for invalid paths, exceeded quotas, or I/O failures.
 pub async fn create_archive_zip(
     source_dir: &Path,
     target_path: &Path,
     include_paths: &[PathBuf],
+    limits: ArchiveLimits,
 ) -> Result<CompressionStats, ArchiveError> {
-    let source_dir = source_dir.to_path_buf();
-    let target_path = target_path.to_path_buf();
-    let include_paths = include_paths.to_vec();
-
+    let source = source_dir.to_path_buf();
+    let target = target_path.to_path_buf();
+    let selected = include_paths.to_vec();
     tokio::task::spawn_blocking(move || {
-        create_archive_zip_sync(&source_dir, &target_path, &include_paths)
+        let paths = sources(&source, &selected, limits)?;
+        let mut writer = zip::ZipWriter::new(BoundedFile::create(&target, limits.bytes)?);
+        let mut budget = Budget::new(limits);
+        for relative in paths {
+            budget.entry()?;
+            let path = source.join(&relative);
+            let name = relative
+                .to_str()
+                .ok_or_else(|| ArchiveError::Compression("archive path is not UTF-8".into()))?;
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if std::fs::symlink_metadata(&path)?.is_dir() {
+                writer
+                    .add_directory(name, options)
+                    .map_err(|error| ArchiveError::Compression(error.to_string()))?;
+            } else {
+                let mut file = open_regular(&path)?;
+                writer
+                    .start_file(name, options)
+                    .map_err(|error| ArchiveError::Compression(error.to_string()))?;
+                budget.copy(&mut file, &mut writer)?;
+            }
+        }
+        let output = writer
+            .finish()
+            .map_err(|error| ArchiveError::Compression(error.to_string()))?;
+        output.file.sync_all()?;
+        Ok(CompressionStats {
+            file_count: budget.files,
+            original_size: budget.bytes,
+            compressed_size: output.file.metadata()?.len(),
+        })
     })
     .await
-    .map_err(|e| ArchiveError::Compression(format!("spawn_blocking failed: {e}")))?
+    .map_err(|error| ArchiveError::Compression(error.to_string()))?
 }
 
-fn create_archive_zip_sync(
-    source_dir: &Path,
-    target_path: &Path,
-    include_paths: &[PathBuf],
-) -> Result<CompressionStats, ArchiveError> {
-    let file = std::fs::File::create(target_path)?;
-    let mut zip_writer = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-
-    let mut file_count: u64 = 0;
-    let mut original_size: u64 = 0;
-
-    for rel_path in include_paths {
-        let full_path = source_dir.join(rel_path);
-        if full_path.is_dir() {
-            for entry in walkdir::WalkDir::new(&full_path) {
-                let entry = entry.map_err(|e| ArchiveError::Io(e.to_string()))?;
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let relative = path
-                    .strip_prefix(source_dir)
-                    .map_err(|e| ArchiveError::Io(e.to_string()))?;
-                let content = std::fs::read(path)?;
-                original_size += content.len() as u64;
-                file_count += 1;
-                trace!("adding to zip: {}", relative.display());
-                zip_writer
-                    .start_file(relative.to_string_lossy(), options)
-                    .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-                zip_writer
-                    .write_all(&content)
-                    .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-            }
-        } else if full_path.is_file() {
-            let content = std::fs::read(&full_path)?;
-            original_size += content.len() as u64;
-            file_count += 1;
-            trace!("adding to zip: {}", rel_path.display());
-            zip_writer
-                .start_file(rel_path.to_string_lossy(), options)
-                .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-            zip_writer
-                .write_all(&content)
-                .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-        } else {
-            debug!("skipping non-existent path: {}", full_path.display());
-        }
-    }
-
-    let finished = zip_writer
-        .finish()
-        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-    let compressed_size = finished
-        .metadata()
-        .map_err(|e| ArchiveError::Io(e.to_string()))?
-        .len();
-
-    Ok(CompressionStats {
-        file_count,
-        original_size,
-        compressed_size,
-    })
-}
-
-/// Creates a tar.gz archive from selected paths within a source directory.
+/// Creates a bounded tar.gz from controlled source paths.
 ///
 /// # Errors
-///
-/// Returns `ArchiveError` on I/O failures or compression errors.
+/// Returns an archive error for links, special files, exceeded quotas, or I/O failures.
 pub async fn create_archive_tar_gz(
     source_dir: &Path,
     target_path: &Path,
     include_paths: &[PathBuf],
+    limits: ArchiveLimits,
 ) -> Result<CompressionStats, ArchiveError> {
-    let source_dir = source_dir.to_path_buf();
-    let target_path = target_path.to_path_buf();
-    let include_paths = include_paths.to_vec();
-
+    let source = source_dir.to_path_buf();
+    let target = target_path.to_path_buf();
+    let selected = include_paths.to_vec();
     tokio::task::spawn_blocking(move || {
-        create_archive_tar_gz_sync(&source_dir, &target_path, &include_paths)
+        let paths = sources(&source, &selected, limits)?;
+        let encoder = flate2::write::GzEncoder::new(
+            BoundedFile::create(&target, limits.bytes)?,
+            flate2::Compression::default(),
+        );
+        let mut writer = tar::Builder::new(encoder);
+        let mut budget = Budget::new(limits);
+        for relative in paths {
+            budget.entry()?;
+            let path = source.join(&relative);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                writer.append_dir(&relative, &path)?;
+            } else {
+                let mut file = open_regular(&path)?;
+                let size = file.metadata()?.len();
+                if size > limits.bytes.saturating_sub(budget.bytes) {
+                    return Err(ArchiveError::Quota);
+                }
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata(&metadata);
+                header.set_size(size);
+                header.set_cksum();
+                writer.append_data(&mut header, &relative, &mut file)?;
+                budget.bytes += size;
+                budget.files += 1;
+            }
+        }
+        let output = writer.into_inner()?.finish()?;
+        output.file.sync_all()?;
+        Ok(CompressionStats {
+            file_count: budget.files,
+            original_size: budget.bytes,
+            compressed_size: output.file.metadata()?.len(),
+        })
     })
     .await
-    .map_err(|e| ArchiveError::Compression(format!("spawn_blocking failed: {e}")))?
+    .map_err(|error| ArchiveError::Compression(error.to_string()))?
 }
 
-fn create_archive_tar_gz_sync(
-    source_dir: &Path,
-    target_path: &Path,
-    include_paths: &[PathBuf],
-) -> Result<CompressionStats, ArchiveError> {
-    let file = std::fs::File::create(target_path)?;
-    let gz_encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    let mut tar_builder = tar::Builder::new(gz_encoder);
-
-    let mut file_count: u64 = 0;
-    let mut original_size: u64 = 0;
-
-    for rel_path in include_paths {
-        let full_path = source_dir.join(rel_path);
-        if full_path.is_dir() {
-            for entry in walkdir::WalkDir::new(&full_path) {
-                let entry = entry.map_err(|e| ArchiveError::Io(e.to_string()))?;
-                let path = entry.path();
-                let relative = path
-                    .strip_prefix(source_dir)
-                    .map_err(|e| ArchiveError::Io(e.to_string()))?;
-
-                if path.is_file() {
-                    let meta = std::fs::metadata(path)?;
-                    original_size += meta.len();
-                    file_count += 1;
-                    trace!("adding to tar: {}", relative.display());
-                    tar_builder
-                        .append_path_with_name(path, relative)
-                        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-                } else if path.is_dir() {
-                    tar_builder
-                        .append_dir(relative, path)
-                        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-                }
-            }
-        } else if full_path.is_file() {
-            let meta = std::fs::metadata(&full_path)?;
-            original_size += meta.len();
-            file_count += 1;
-            trace!("adding to tar: {}", rel_path.display());
-            tar_builder
-                .append_path_with_name(&full_path, rel_path)
-                .map_err(|e| ArchiveError::Compression(e.to_string()))?;
+fn destination(root: &Path, relative: &Path, directory: bool) -> Result<PathBuf, ArchiveError> {
+    relative_path(relative)?;
+    ensure_restore_directory(root)?;
+    let mut path = root.to_path_buf();
+    let components: Vec<_> = relative
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .collect();
+    for (index, component) in components.iter().enumerate() {
+        path.push(component.as_os_str());
+        if directory || index + 1 < components.len() {
+            ensure_restore_directory(&path)?;
         } else {
-            debug!("skipping non-existent path: {}", full_path.display());
+            reject_restore_symlink(&path)?;
         }
     }
-
-    let gz_encoder = tar_builder
-        .into_inner()
-        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-    let file = gz_encoder
-        .finish()
-        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-    let compressed_size = file
-        .metadata()
-        .map_err(|e| ArchiveError::Io(e.to_string()))?
-        .len();
-
-    Ok(CompressionStats {
-        file_count,
-        original_size,
-        compressed_size,
-    })
+    Ok(path)
 }
-
-/// Extracts a zip archive to a target directory.
-///
-/// Existing destination links are rejected. The caller must keep the destination
-/// directory tree exclusively controlled for the duration of extraction.
-///
-/// # Errors
-///
-/// Returns `ArchiveError` if the archive is invalid or I/O errors occur.
-pub async fn extract_archive_zip(
-    archive_path: &Path,
-    target_dir: &Path,
-) -> Result<(), ArchiveError> {
-    let archive_path = archive_path.to_path_buf();
-    let target_dir = target_dir.to_path_buf();
-
-    tokio::task::spawn_blocking(move || extract_archive_zip_sync(&archive_path, &target_dir))
-        .await
-        .map_err(|e| ArchiveError::Compression(format!("spawn_blocking failed: {e}")))?
-}
-
-fn extract_archive_zip_sync(archive_path: &Path, target_dir: &Path) -> Result<(), ArchiveError> {
-    let file = std::fs::File::open(archive_path)?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| ArchiveError::Compression(e.to_string()))?;
-
-    ensure_restore_directory(target_dir)?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-        // Validate archive paths separately from existing destination entries.
-        let Some(relative) = entry.enclosed_name() else {
-            return Err(ArchiveError::Compression(
-                "archive entry escapes the target directory".into(),
-            ));
-        };
-        if entry.is_symlink() {
-            continue;
-        }
-        let mut out_path = target_dir.to_path_buf();
-        let mut components = relative.components().peekable();
-        while let Some(component) = components.next() {
-            match component {
-                Component::Normal(name) => out_path.push(name),
-                Component::CurDir => continue,
-                _ => {
-                    return Err(ArchiveError::Compression(
-                        "archive entry escapes the target directory".into(),
-                    ));
-                }
-            }
-            if components.peek().is_some() || entry.is_dir() {
-                ensure_restore_directory(&out_path)?;
-            } else {
-                reject_restore_symlink(&out_path)?;
-                let mut options = std::fs::OpenOptions::new();
-                // Truncate only after checking the opened file metadata.
-                options.write(true).create(true).truncate(false);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.custom_flags(nix::libc::O_NOFOLLOW);
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    // Open the reparse point itself, not its target.
-                    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-                    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-                }
-                let mut outfile = options.open(&out_path)?;
-                let metadata = outfile.metadata()?;
-                if is_restore_link(&metadata) || !metadata.is_file() {
-                    return Err(ArchiveError::Compression(format!(
-                        "restore destination is not a regular file: {}",
-                        out_path.display()
-                    )));
-                }
-                outfile.set_len(0)?;
-                std::io::copy(&mut entry, &mut outfile)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn is_restore_link(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        const REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
         metadata.file_type().is_symlink()
     }
 }
-
 fn reject_restore_symlink(path: &Path) -> Result<(), ArchiveError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if is_restore_link(&metadata) => Err(ArchiveError::Compression(format!(
-            "restore destination contains a symbolic link: {}",
-            path.display()
-        ))),
+        Ok(metadata) if is_restore_link(&metadata) => Err(ArchiveError::Compression(
+            "restore destination contains a link".into(),
+        )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
-
 fn ensure_restore_directory(path: &Path) -> Result<(), ArchiveError> {
     reject_restore_symlink(path)?;
     std::fs::create_dir_all(path)?;
+    reject_restore_symlink(path)
+}
+fn output_file(path: &Path) -> Result<std::fs::File, ArchiveError> {
     reject_restore_symlink(path)?;
-    Ok(())
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let output = options.open(path)?;
+    if !output.metadata()?.is_file() {
+        return Err(ArchiveError::Compression(
+            "restore output is not a regular file".into(),
+        ));
+    }
+    output.set_len(0)?;
+    Ok(output)
 }
 
-/// Extracts a tar.gz archive to a target directory.
+/// Extracts a bounded ZIP into a directory held exclusively by the caller.
 ///
 /// # Errors
+/// Returns an archive error for invalid entries, links, exceeded quotas, or I/O failures.
+pub async fn extract_archive_zip(
+    archive_path: &Path,
+    target_dir: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ArchiveError> {
+    let source = archive_path.to_path_buf();
+    let target = target_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut archive = zip::ZipArchive::new(open_regular(&source)?)
+            .map_err(|error| ArchiveError::Compression(error.to_string()))?;
+        let mut budget = Budget::new(limits);
+        ensure_restore_directory(&target)?;
+        for index in 0..archive.len() {
+            budget.entry()?;
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|error| ArchiveError::Compression(error.to_string()))?;
+            const FILE_TYPE_MASK: u32 = 0o170000;
+            const REGULAR_FILE: u32 = 0o100000;
+            const DIRECTORY: u32 = 0o040000;
+            let special = entry
+                .unix_mode()
+                .is_some_and(|mode| !matches!(mode & FILE_TYPE_MASK, 0 | REGULAR_FILE | DIRECTORY));
+            if entry.is_symlink() || special {
+                return Err(ArchiveError::Compression("archive contains a link".into()));
+            }
+            let relative = entry.enclosed_name().ok_or_else(|| {
+                ArchiveError::Compression("archive path escapes the target".into())
+            })?;
+            let path = destination(&target, &relative, entry.is_dir())?;
+            if !entry.is_dir() {
+                let mut output = output_file(&path)?;
+                budget.copy(&mut entry, &mut output)?;
+                output.sync_all()?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| ArchiveError::Compression(error.to_string()))?
+}
+
+/// Extracts bounded regular files and directories from a tar.gz archive.
 ///
-/// Returns `ArchiveError` if the archive is invalid or I/O errors occur.
+/// # Errors
+/// Returns an archive error for invalid paths, links, special files, exceeded quotas, or I/O failures.
 pub async fn extract_archive_tar_gz(
     archive_path: &Path,
     target_dir: &Path,
+    limits: ArchiveLimits,
 ) -> Result<(), ArchiveError> {
-    let archive_path = archive_path.to_path_buf();
-    let target_dir = target_dir.to_path_buf();
-
-    tokio::task::spawn_blocking(move || extract_archive_tar_gz_sync(&archive_path, &target_dir))
-        .await
-        .map_err(|e| ArchiveError::Compression(format!("spawn_blocking failed: {e}")))?
+    let source = archive_path.to_path_buf();
+    let target = target_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let decoder = flate2::read::GzDecoder::new(open_regular(&source)?);
+        let mut archive = tar::Archive::new(decoder);
+        let mut budget = Budget::new(limits);
+        ensure_restore_directory(&target)?;
+        let mut long_name: Option<PathBuf> = None;
+        let mut directory_modes = Vec::new();
+        const PATH_BYTES: u64 = 4096;
+        for entry in archive.entries()?.raw(true) {
+            let mut entry = entry?;
+            let kind = entry.header().entry_type();
+            if kind.is_gnu_longname() {
+                if long_name.is_some() || entry.size() > PATH_BYTES {
+                    return Err(ArchiveError::Quota);
+                }
+                let mut name = Vec::new();
+                entry.read_to_end(&mut name)?;
+                if name.last() == Some(&0) {
+                    name.pop();
+                }
+                let name = String::from_utf8(name)
+                    .map_err(|_| ArchiveError::Compression("archive path is not UTF-8".into()))?;
+                long_name = Some(PathBuf::from(name));
+                continue;
+            }
+            budget.entry()?;
+            if !kind.is_file() && !kind.is_dir() {
+                return Err(ArchiveError::Compression(
+                    "archive contains a link or special file".into(),
+                ));
+            }
+            let relative = match long_name.take() {
+                Some(path) => path,
+                None => entry.path()?.into_owned(),
+            };
+            let path = destination(&target, &relative, kind.is_dir())?;
+            let mode = entry.header().mode()?;
+            if kind.is_file() {
+                let mut output = output_file(&path)?;
+                budget.copy(&mut entry, &mut output)?;
+                restore_mode(&path, mode)?;
+                output.sync_all()?;
+            } else {
+                directory_modes.push((path, mode));
+            }
+        }
+        if long_name.is_some() {
+            return Err(ArchiveError::Compression(
+                "archive ends in an incomplete path entry".into(),
+            ));
+        }
+        for (path, mode) in directory_modes.into_iter().rev() {
+            restore_mode(&path, mode)?;
+        }
+        // Finish the gzip stream so truncated input is reported.
+        let mut decoder = archive.into_inner();
+        const TRAILING_BYTES: u64 = 64 * 1024;
+        let mut tail = Budget::new(ArchiveLimits {
+            bytes: TRAILING_BYTES,
+            entries: 1,
+        });
+        tail.copy(&mut decoder, &mut std::io::sink())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| ArchiveError::Compression(error.to_string()))?
 }
 
-fn extract_archive_tar_gz_sync(archive_path: &Path, target_dir: &Path) -> Result<(), ArchiveError> {
-    let file = std::fs::File::open(archive_path)?;
-    let gz_decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz_decoder);
-
-    archive
-        .unpack(target_dir)
-        .map_err(|e| ArchiveError::Compression(e.to_string()))?;
-
+fn restore_mode(path: &Path, mode: u32) -> Result<(), ArchiveError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     Ok(())
 }
 
@@ -389,7 +543,7 @@ mod tests {
         let include: Vec<PathBuf> =
             vec![PathBuf::from("world"), PathBuf::from("server.properties")];
 
-        let stats = create_archive_zip(&source, &archive_path, &include)
+        let stats = create_archive_zip(&source, &archive_path, &include, ArchiveLimits::default())
             .await
             .unwrap();
 
@@ -402,7 +556,7 @@ mod tests {
 
         // Extract and verify
         let extract_dir = tmpdir.path().join("restored");
-        extract_archive_zip(&archive_path, &extract_dir)
+        extract_archive_zip(&archive_path, &extract_dir, ArchiveLimits::default())
             .await
             .unwrap();
 
@@ -423,7 +577,13 @@ mod tests {
             std::fs::create_dir_all(source.join("world"))?;
             std::fs::write(source.join("world/level.dat"), b"replacement")?;
             let archive = temp.path().join("backup.zip");
-            create_archive_zip(&source, &archive, &[PathBuf::from("world")]).await?;
+            create_archive_zip(
+                &source,
+                &archive,
+                &[PathBuf::from("world")],
+                ArchiveLimits::default(),
+            )
+            .await?;
             let outside = temp.path().join("outside");
             std::fs::create_dir_all(outside.join("world"))?;
             std::fs::write(outside.join("level.dat"), b"external data")?;
@@ -446,7 +606,9 @@ mod tests {
                 }
             }
             assert!(
-                extract_archive_zip(&archive, &target).await.is_err(),
+                extract_archive_zip(&archive, &target, ArchiveLimits::default())
+                    .await
+                    .is_err(),
                 "{link_kind}"
             );
             assert_eq!(std::fs::read(outside.join("level.dat"))?, b"external data");
@@ -466,11 +628,17 @@ mod tests {
         std::fs::create_dir_all(source.join("world"))?;
         std::fs::write(source.join("world/level.dat"), b"new")?;
         let archive = temp.path().join("backup.zip");
-        create_archive_zip(&source, &archive, &[PathBuf::from("world")]).await?;
+        create_archive_zip(
+            &source,
+            &archive,
+            &[PathBuf::from("world")],
+            ArchiveLimits::default(),
+        )
+        .await?;
         let target = temp.path().join("restored");
         std::fs::create_dir_all(target.join("world"))?;
         std::fs::write(target.join("world/level.dat"), b"previous longer contents")?;
-        extract_archive_zip(&archive, &target).await?;
+        extract_archive_zip(&archive, &target, ArchiveLimits::default()).await?;
         assert_eq!(std::fs::read(target.join("world/level.dat"))?, b"new");
         Ok(())
     }
@@ -482,24 +650,36 @@ mod tests {
         std::fs::create_dir_all(source.join("world/data")).unwrap();
         std::fs::write(source.join("world/data/file.txt"), b"hello world").unwrap();
         std::fs::write(source.join("config.yml"), b"config: true").unwrap();
+        let long_directory = PathBuf::from("world").join("long-directory-".repeat(12));
+        std::fs::create_dir_all(source.join(&long_directory)).unwrap();
+        std::fs::write(
+            source.join(&long_directory).join("long-path.txt"),
+            b"long path",
+        )
+        .unwrap();
 
         let archive_path = tmpdir.path().join("backup.tar.gz");
         let include: Vec<PathBuf> = vec![PathBuf::from("world"), PathBuf::from("config.yml")];
 
-        let stats = create_archive_tar_gz(&source, &archive_path, &include)
-            .await
-            .unwrap();
+        let stats =
+            create_archive_tar_gz(&source, &archive_path, &include, ArchiveLimits::default())
+                .await
+                .unwrap();
 
-        assert_eq!(stats.file_count, 2);
+        assert_eq!(stats.file_count, 3);
         assert!(stats.compressed_size > 0);
 
         let extract_dir = tmpdir.path().join("restored");
-        extract_archive_tar_gz(&archive_path, &extract_dir)
+        extract_archive_tar_gz(&archive_path, &extract_dir, ArchiveLimits::default())
             .await
             .unwrap();
 
         assert!(extract_dir.join("world/data/file.txt").exists());
         assert!(extract_dir.join("config.yml").exists());
+        assert_eq!(
+            std::fs::read(extract_dir.join(long_directory).join("long-path.txt")).unwrap(),
+            b"long path"
+        );
     }
 
     #[tokio::test]
@@ -516,20 +696,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skip_non_existent_paths() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let source = tmpdir.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("exists.txt"), b"data").unwrap();
-
-        let archive_path = tmpdir.path().join("backup.zip");
-        let include: Vec<PathBuf> =
-            vec![PathBuf::from("exists.txt"), PathBuf::from("does-not-exist")];
-
-        let stats = create_archive_zip(&source, &archive_path, &include)
+    async fn missing_selected_paths_fail_archive_creation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("backup.zip");
+        assert!(
+            create_archive_zip(
+                directory.path(),
+                &archive,
+                &[PathBuf::from("missing")],
+                ArchiveLimits::default()
+            )
             .await
-            .unwrap();
-        assert_eq!(stats.file_count, 1);
+            .is_err()
+        );
+        assert!(!archive.try_exists()?);
+        Ok(())
     }
 
     #[tokio::test]
@@ -539,7 +721,7 @@ mod tests {
         std::fs::write(&bad_zip, b"this is not a valid zip file").unwrap();
 
         let out = tmpdir.path().join("out");
-        let result = extract_archive_zip(&bad_zip, &out).await;
+        let result = extract_archive_zip(&bad_zip, &out, ArchiveLimits::default()).await;
         assert!(result.is_err(), "extracting invalid zip should fail");
     }
 
@@ -549,7 +731,7 @@ mod tests {
         let missing = tmpdir.path().join("missing.zip");
 
         let out = tmpdir.path().join("out");
-        let result = extract_archive_zip(&missing, &out).await;
+        let result = extract_archive_zip(&missing, &out, ArchiveLimits::default()).await;
         assert!(
             result.is_err(),
             "extracting nonexistent archive should fail"
@@ -574,7 +756,7 @@ mod tests {
         let archive_path = tmpdir.path().join("empty.zip");
         let include: Vec<PathBuf> = vec![];
 
-        let stats = create_archive_zip(&source, &archive_path, &include)
+        let stats = create_archive_zip(&source, &archive_path, &include, ArchiveLimits::default())
             .await
             .unwrap();
         assert_eq!(stats.file_count, 0);

@@ -2,13 +2,41 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::archive::compress;
-use crate::archive::metadata::{ArchiveMetadata, ArchiveScope, CompressionAlgorithm};
-use crate::archive::strategy::{ArchiveStrategy, archive_path_for, meta_path_for};
+use crate::archive::metadata::{
+    ArchiveMetadata, ArchiveScope, CompressionAlgorithm, METADATA_BYTES, METADATA_FILE,
+    data_filename,
+};
+use crate::archive::strategy::{ArchiveStrategy, archive_path_for};
 use crate::archive::{ArchiveError, ArchiveResult};
 use crate::core::state::InstanceState;
+
+/// Server-created identity and description for a new archive.
+#[derive(Debug)]
+pub struct ArchiveRequest<'a> {
+    /// Generated archive identifier, available before publication.
+    pub id: String,
+    /// Instance owning the data.
+    pub instance_id: &'a str,
+    /// Operator description.
+    pub label: &'a str,
+    /// Optional game release recorded with the archive.
+    pub game_version: Option<&'a str>,
+}
+impl<'a> ArchiveRequest<'a> {
+    /// Allocates an archive identity before filesystem publication.
+    #[must_use]
+    pub fn new(instance_id: &'a str, label: &'a str) -> Self {
+        Self {
+            id: uuid::Uuid::now_v7().to_string(),
+            instance_id,
+            label,
+            game_version: None,
+        }
+    }
+}
 
 /// Configuration for the archive manager.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +51,10 @@ pub struct ArchiveConfig {
     pub max_archives_per_instance: usize,
     /// Whether to auto-cleanup after each archive.
     pub auto_cleanup: bool,
+    /// Maximum retained compressed bytes per instance.
+    pub max_bytes_per_instance: u64,
+    /// Bounds for each archive and its expanded contents.
+    pub limits: compress::ArchiveLimits,
 }
 
 impl Default for ArchiveConfig {
@@ -33,25 +65,30 @@ impl Default for ArchiveConfig {
             default_scope: ArchiveScope::Full,
             max_archives_per_instance: 10,
             auto_cleanup: true,
+            max_bytes_per_instance: 100 * 1024 * 1024 * 1024,
+            limits: compress::ArchiveLimits::default(),
         }
     }
 }
 
 /// Core archive manager for creating, listing, restoring, and deleting archives.
 ///
-/// Archives are stored in `{base_dir}/{instance_id}/` as:
-/// - `{archive_id}.{ext}` — the compressed data
-/// - `{archive_id}.meta.json` — metadata
+/// Each archive is published as one directory containing data and metadata.
+/// The caller must hold exclusive ownership of the configured archive store.
 #[derive(Debug, Clone)]
 pub struct ArchiveManager {
     config: ArchiveConfig,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ArchiveManager {
     /// Creates a new archive manager with the given configuration.
     #[must_use]
-    pub const fn new(config: ArchiveConfig) -> Self {
-        Self { config }
+    pub fn new(config: ArchiveConfig) -> Self {
+        Self {
+            config,
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// Returns the archive directory for a specific instance.
@@ -65,54 +102,80 @@ impl ArchiveManager {
     ///
     /// Returns `ArchiveError` if the archive directory cannot be read or metadata is corrupt.
     pub async fn list(&self, instance_id: &str) -> ArchiveResult<Vec<ArchiveMetadata>> {
+        validate_id(instance_id)?;
         let dir = self.instance_archives_dir(instance_id);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        let mut metadatas: Vec<ArchiveMetadata> = Vec::new();
-
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut metadata = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json")
-                && let Ok(content) = tokio::fs::read_to_string(&path).await
-            {
-                match serde_json::from_str::<ArchiveMetadata>(&content) {
-                    Ok(meta) => metadatas.push(meta),
-                    Err(e) => {
-                        warn!("failed to parse archive metadata {}: {}", path.display(), e);
-                    }
-                }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ArchiveError::InvalidId("archive filename is not UTF-8".into()))?;
+            if name.starts_with(".pending-") || name.starts_with(".deleting-") {
+                continue;
             }
+            if !entry.file_type().await?.is_dir() {
+                return Err(ArchiveError::MetadataParse(
+                    "archive store contains an unexpected entry".into(),
+                ));
+            }
+            metadata.push(self.find_metadata(instance_id, &name).await?);
         }
-
-        // Sort oldest first by creation time
-        metadatas.sort_by_key(|a| a.created_at);
-
-        Ok(metadatas)
+        metadata.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(metadata)
     }
 
-    /// Finds archive metadata by ID.
-    async fn find_metadata(&self, archive_id: &str) -> ArchiveResult<ArchiveMetadata> {
-        // Search all instance subdirectories
-        if !self.config.base_dir.exists() {
-            return Err(ArchiveError::NotFound(archive_id.to_string()));
+    /// Reads metadata bound to an instance and archive identifier.
+    ///
+    /// # Errors
+    /// Returns an archive error for invalid ownership, missing data, or corrupt metadata.
+    pub async fn find_metadata(
+        &self,
+        instance_id: &str,
+        archive_id: &str,
+    ) -> ArchiveResult<ArchiveMetadata> {
+        validate_id(instance_id)?;
+        validate_id(archive_id)?;
+        let dir = self.instance_archives_dir(instance_id).join(archive_id);
+        let kind = tokio::fs::symlink_metadata(&dir).await?;
+        if !kind.is_dir() || kind.is_symlink() {
+            return Err(ArchiveError::MetadataParse(
+                "archive is not a directory".into(),
+            ));
         }
-
-        let mut entries = tokio::fs::read_dir(&self.config.base_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                let meta_path = entry.path().join(format!("{archive_id}.meta.json"));
-                if meta_path.exists() {
-                    let content = tokio::fs::read_to_string(&meta_path).await?;
-                    return serde_json::from_str(&content)
-                        .map_err(|e| ArchiveError::MetadataParse(e.to_string()));
-                }
-            }
+        let meta_path = dir.join(METADATA_FILE);
+        let file = tokio::fs::symlink_metadata(&meta_path).await?;
+        if !file.is_file() || file.is_symlink() || file.len() > METADATA_BYTES {
+            return Err(ArchiveError::MetadataParse(
+                "invalid archive metadata file".into(),
+            ));
         }
-
-        Err(ArchiveError::NotFound(archive_id.to_string()))
+        let metadata: ArchiveMetadata = serde_json::from_slice(&tokio::fs::read(&meta_path).await?)
+            .map_err(|error| ArchiveError::MetadataParse(error.to_string()))?;
+        if metadata.id != archive_id || metadata.instance_id != instance_id {
+            return Err(ArchiveError::MetadataParse(
+                "archive ownership differs from its storage location".into(),
+            ));
+        }
+        let file = tokio::fs::symlink_metadata(archive_path_for(
+            &self.instance_archives_dir(instance_id),
+            &metadata,
+        ))
+        .await?;
+        if !file.is_file() || file.is_symlink() || file.len() != metadata.compressed_size {
+            return Err(ArchiveError::MetadataParse(
+                "archive data differs from its metadata".into(),
+            ));
+        }
+        Ok(metadata)
     }
 
     /// Creates a new archive for the given instance.
@@ -125,13 +188,23 @@ impl ArchiveManager {
     /// compression fails, or metadata cannot be written.
     pub async fn create(
         &self,
-        instance_id: &str,
+        request: &ArchiveRequest<'_>,
         instance_dir: &Path,
-        label: &str,
         state: InstanceState,
-        game_version: Option<&str>,
         strategy: &dyn ArchiveStrategy,
     ) -> ArchiveResult<ArchiveMetadata> {
+        let _guard = self.gate.lock().await;
+        let instance_id = request.instance_id;
+        let label = request.label;
+        let game_version = request.game_version;
+        validate_id(instance_id)?;
+        validate_id(&request.id)?;
+        if self.config.max_bytes_per_instance == 0
+            || self.config.limits.bytes == 0
+            || self.config.limits.entries == 0
+        {
+            return Err(ArchiveError::Quota);
+        }
         // Instance must be stopped for data consistency
         if state != InstanceState::Stopped {
             return Err(ArchiveError::InstanceNotStopped(state));
@@ -140,95 +213,220 @@ impl ArchiveManager {
         let archives_dir = self.instance_archives_dir(instance_id);
         tokio::fs::create_dir_all(&archives_dir).await?;
 
+        self.remove_pending(instance_id).await?;
         // Generate archive ID (UUID v7 = time-sortable)
-        let archive_id = uuid::Uuid::now_v7().to_string();
+        let archive_id = request.id.clone();
+        if archives_dir.join(&archive_id).try_exists()? {
+            return Err(ArchiveError::InvalidId("archive ID already exists".into()));
+        }
 
         // Select paths to include
         let existing = self.list(instance_id).await?;
         let include_paths = strategy.select_paths(instance_dir, &existing)?;
 
         // Compute world names from included paths
-        let world_names = self.detect_world_names(instance_dir, &include_paths);
+        let world_names = self.detect_world_names(instance_dir, &include_paths)?;
 
         // Determine scope from strategy or config
         let scope = self.infer_scope(&include_paths, instance_dir);
 
-        let extension = self.config.algorithm.extension();
-        let archive_path = archives_dir.join(format!("{archive_id}.{extension}"));
+        let pending = archives_dir.join(format!(".pending-{archive_id}"));
+        tokio::fs::create_dir(&pending).await?;
+        let result = async {
+            let archive_path = pending.join(data_filename(&self.config.algorithm));
 
-        info!(
-            "creating archive {} for instance {} ({} paths, {:?})",
-            archive_id,
-            instance_id,
-            include_paths.len(),
-            self.config.algorithm
-        );
+            info!(
+                "creating archive {} for instance {} ({} paths, {:?})",
+                archive_id,
+                instance_id,
+                include_paths.len(),
+                self.config.algorithm
+            );
 
-        // Create the archive
-        let stats = match self.config.algorithm {
-            CompressionAlgorithm::Zip => {
-                compress::create_archive_zip(instance_dir, &archive_path, &include_paths).await?
-            }
-            CompressionAlgorithm::TarGz => {
-                compress::create_archive_tar_gz(instance_dir, &archive_path, &include_paths).await?
-            }
-        };
-
-        // Compute SHA-256
-        let sha256 = compress::compute_sha256(&archive_path).await?;
-
-        // Build and persist metadata
-        let metadata = ArchiveMetadata {
-            id: archive_id.clone(),
-            label: label.to_string(),
-            instance_id: instance_id.to_string(),
-            created_at: Utc::now(),
-            game_version: game_version.map(std::string::ToString::to_string),
-            scope,
-            algorithm: self.config.algorithm.clone(),
-            instance_state: state,
-            file_count: stats.file_count,
-            original_size: stats.original_size,
-            compressed_size: stats.compressed_size,
-            sha256,
-            world_names,
-        };
-
-        let meta_path = meta_path_for(&archives_dir, &metadata);
-        let meta_json =
-            serde_json::to_string_pretty(&metadata).map_err(|e| ArchiveError::Io(e.to_string()))?;
-        tokio::fs::write(&meta_path, meta_json).await?;
-
-        // Auto-cleanup if configured
-        if self.config.auto_cleanup && self.config.max_archives_per_instance > 0 {
-            let all = self.list(instance_id).await?;
-            if all.len() > self.config.max_archives_per_instance {
-                let excess = all.len() - self.config.max_archives_per_instance;
-                let mut removed: usize = 0;
-                for meta in all.iter().take(excess) {
-                    self.remove_files(&archives_dir, meta).await?;
-                    removed += 1;
+            // Create the archive
+            let stats = match self.config.algorithm {
+                CompressionAlgorithm::Zip => {
+                    compress::create_archive_zip(
+                        instance_dir,
+                        &archive_path,
+                        &include_paths,
+                        self.config.limits,
+                    )
+                    .await?
                 }
-                if removed > 0 {
-                    info!("auto-cleanup removed {removed} old archives for {instance_id}");
+                CompressionAlgorithm::TarGz => {
+                    compress::create_archive_tar_gz(
+                        instance_dir,
+                        &archive_path,
+                        &include_paths,
+                        self.config.limits,
+                    )
+                    .await?
                 }
+            };
+
+            // Compute SHA-256
+            let sha256 = compress::compute_sha256(&archive_path).await?;
+
+            // Build and persist metadata
+            let metadata = ArchiveMetadata {
+                id: archive_id.clone(),
+                label: label.to_string(),
+                instance_id: instance_id.to_string(),
+                created_at: Utc::now(),
+                game_version: game_version.map(std::string::ToString::to_string),
+                scope,
+                algorithm: self.config.algorithm.clone(),
+                instance_state: state,
+                file_count: stats.file_count,
+                original_size: stats.original_size,
+                compressed_size: stats.compressed_size,
+                sha256,
+                world_names,
+            };
+
+            if metadata.compressed_size > self.config.max_bytes_per_instance {
+                return Err(ArchiveError::Quota);
             }
+            let meta_path = pending.join(METADATA_FILE);
+            let meta_json = serde_json::to_string_pretty(&metadata)
+                .map_err(|e| ArchiveError::Io(e.to_string()))?;
+            if meta_json.len() as u64 > METADATA_BYTES {
+                return Err(ArchiveError::Quota);
+            }
+            tokio::fs::write(&meta_path, meta_json).await?;
+            sync_directory(&pending)?;
+            std::fs::File::open(&meta_path)?.sync_all()?;
+            tokio::fs::rename(&pending, archives_dir.join(&archive_id)).await?;
+            sync_directory(&archives_dir)?;
+
+            if self.config.auto_cleanup {
+                self.retain(
+                    instance_id,
+                    self.config.max_archives_per_instance,
+                    Some(&metadata.id),
+                )
+                .await?;
+            }
+
+            info!(
+                "archive {} created: {} files, {} → {} bytes (ratio: {:.1}%)",
+                archive_id,
+                stats.file_count,
+                stats.original_size,
+                stats.compressed_size,
+                if stats.original_size > 0 {
+                    (stats.compressed_size as f64 / stats.original_size as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
+
+            Ok(metadata)
         }
+        .await;
+        finish_pending(&pending, result).await
+    }
 
-        info!(
-            "archive {} created: {} files, {} → {} bytes (ratio: {:.1}%)",
-            archive_id,
-            stats.file_count,
-            stats.original_size,
-            stats.compressed_size,
-            if stats.original_size > 0 {
-                (stats.compressed_size as f64 / stats.original_size as f64) * 100.0
-            } else {
-                0.0
+    /// Opens immutable archive data for an encrypted transfer.
+    ///
+    /// # Errors
+    /// Returns an archive error if ownership or stored data is invalid.
+    pub async fn open_data(
+        &self,
+        instance_id: &str,
+        archive_id: &str,
+    ) -> ArchiveResult<std::fs::File> {
+        let metadata = self.find_metadata(instance_id, archive_id).await?;
+        let path = archive_path_for(&self.instance_archives_dir(instance_id), &metadata);
+        compress::open_regular(&path)
+    }
+
+    /// Publishes an imported archive and its metadata under the instance quota.
+    ///
+    /// # Errors
+    /// Returns an archive error for an occupied ID, invalid ownership, exceeded quotas, or I/O failure.
+    pub async fn import(
+        &self,
+        metadata: ArchiveMetadata,
+        source: &Path,
+    ) -> ArchiveResult<ArchiveMetadata> {
+        let _guard = self.gate.lock().await;
+        validate_id(&metadata.id)?;
+        validate_id(&metadata.instance_id)?;
+        if metadata.compressed_size > self.config.limits.bytes
+            || metadata.compressed_size > self.config.max_bytes_per_instance
+            || metadata.original_size > self.config.limits.bytes
+            || metadata.file_count > self.config.limits.entries
+        {
+            return Err(ArchiveError::Quota);
+        }
+        let root = self.instance_archives_dir(&metadata.instance_id);
+        tokio::fs::create_dir_all(&root).await?;
+        let final_path = root.join(&metadata.id);
+        if final_path.try_exists()? {
+            return Err(ArchiveError::InvalidId("archive ID already exists".into()));
+        }
+        self.remove_pending(&metadata.instance_id).await?;
+        let pending = root.join(format!(".pending-{}", metadata.id));
+        tokio::fs::create_dir(&pending).await?;
+        let result = async {
+            let data = pending.join(data_filename(&metadata.algorithm));
+            let source = source.to_path_buf();
+            let output_path = data.clone();
+            let bytes = metadata.compressed_size;
+            tokio::task::spawn_blocking(move || -> ArchiveResult<()> {
+                use std::io::Read;
+                let mut input = compress::open_regular(&source)?;
+                if input.metadata()?.len() != bytes {
+                    return Err(ArchiveError::MetadataParse(
+                        "import size differs from metadata".into(),
+                    ));
+                }
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(output_path)?;
+                let copied = std::io::copy(&mut (&mut input).take(bytes), &mut output)?;
+                let mut extra = [0u8; 1];
+                if copied != bytes || input.read(&mut extra)? != 0 {
+                    return Err(ArchiveError::Quota);
+                }
+                output.sync_all()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| ArchiveError::Io(error.to_string()))??;
+            let actual = compress::compute_sha256(&data).await?;
+            if actual != metadata.sha256 {
+                return Err(ArchiveError::HashMismatch {
+                    expected: metadata.sha256.clone(),
+                    actual,
+                });
             }
-        );
-
-        Ok(metadata)
+            let meta_path = pending.join(METADATA_FILE);
+            let content = serde_json::to_vec(&metadata)
+                .map_err(|error| ArchiveError::MetadataParse(error.to_string()))?;
+            if content.len() as u64 > METADATA_BYTES {
+                return Err(ArchiveError::Quota);
+            }
+            tokio::fs::write(&meta_path, content).await?;
+            std::fs::File::open(meta_path)?.sync_all()?;
+            sync_directory(&pending)?;
+            tokio::fs::rename(&pending, final_path).await?;
+            sync_directory(&root)?;
+            if self.config.auto_cleanup {
+                self.retain(
+                    &metadata.instance_id,
+                    self.config.max_archives_per_instance,
+                    Some(&metadata.id),
+                )
+                .await?;
+            }
+            Ok(metadata)
+        }
+        .await;
+        finish_pending(&pending, result).await
     }
 
     /// Restores an archive to a target directory (typically the instance directory).
@@ -239,8 +437,13 @@ impl ArchiveManager {
     ///
     /// Returns `ArchiveError` if the archive is not found, SHA-256 verification fails,
     /// or extraction fails.
-    pub async fn restore(&self, archive_id: &str, target_dir: &Path) -> ArchiveResult<()> {
-        let metadata = self.find_metadata(archive_id).await?;
+    pub async fn restore(
+        &self,
+        instance_id: &str,
+        archive_id: &str,
+        target_dir: &Path,
+    ) -> ArchiveResult<()> {
+        let metadata = self.find_metadata(instance_id, archive_id).await?;
 
         // Locate the archive file
         let archives_dir = self.instance_archives_dir(&metadata.instance_id);
@@ -274,10 +477,12 @@ impl ArchiveManager {
         // Extract
         match metadata.algorithm {
             CompressionAlgorithm::Zip => {
-                compress::extract_archive_zip(&archive_path, target_dir).await?;
+                compress::extract_archive_zip(&archive_path, target_dir, self.config.limits)
+                    .await?;
             }
             CompressionAlgorithm::TarGz => {
-                compress::extract_archive_tar_gz(&archive_path, target_dir).await?;
+                compress::extract_archive_tar_gz(&archive_path, target_dir, self.config.limits)
+                    .await?;
             }
         }
 
@@ -295,8 +500,9 @@ impl ArchiveManager {
     /// # Errors
     ///
     /// Returns `ArchiveError` if the archive is not found.
-    pub async fn delete(&self, archive_id: &str) -> ArchiveResult<()> {
-        let metadata = self.find_metadata(archive_id).await?;
+    pub async fn delete(&self, instance_id: &str, archive_id: &str) -> ArchiveResult<()> {
+        let _guard = self.gate.lock().await;
+        let metadata = self.find_metadata(instance_id, archive_id).await?;
         let archives_dir = self.instance_archives_dir(&metadata.instance_id);
 
         self.remove_files(&archives_dir, &metadata).await?;
@@ -312,8 +518,8 @@ impl ArchiveManager {
     /// # Errors
     ///
     /// Returns `ArchiveError` if the archive is not found or cannot be read.
-    pub async fn verify(&self, archive_id: &str) -> ArchiveResult<bool> {
-        let metadata = self.find_metadata(archive_id).await?;
+    pub async fn verify(&self, instance_id: &str, archive_id: &str) -> ArchiveResult<bool> {
+        let metadata = self.find_metadata(instance_id, archive_id).await?;
         let archives_dir = self.instance_archives_dir(&metadata.instance_id);
         let archive_path = archive_path_for(&archives_dir, &metadata);
 
@@ -336,75 +542,94 @@ impl ArchiveManager {
     ///
     /// Returns `ArchiveError` on I/O errors.
     pub async fn cleanup(&self, instance_id: &str, max_archives: usize) -> ArchiveResult<usize> {
-        if max_archives == 0 {
-            return Ok(0);
-        }
+        let _guard = self.gate.lock().await;
+        self.retain(instance_id, max_archives, None).await
+    }
 
+    async fn retain(
+        &self,
+        instance_id: &str,
+        maximum: usize,
+        protected: Option<&str>,
+    ) -> ArchiveResult<usize> {
         let all = self.list(instance_id).await?;
-        if all.len() <= max_archives {
-            return Ok(0);
-        }
-
-        let archives_dir = self.instance_archives_dir(instance_id);
-        let excess = all.len() - max_archives;
-        let mut removed: usize = 0;
-
-        for meta in all.iter().take(excess) {
-            self.remove_files(&archives_dir, meta).await?;
+        let mut bytes = all.iter().try_fold(0u64, |sum, meta| {
+            sum.checked_add(meta.compressed_size)
+                .ok_or(ArchiveError::Quota)
+        })?;
+        let mut count = all.len();
+        let mut removed = 0;
+        let dir = self.instance_archives_dir(instance_id);
+        for metadata in &all {
+            if protected == Some(metadata.id.as_str()) {
+                continue;
+            }
+            if (maximum == 0 || count <= maximum) && bytes <= self.config.max_bytes_per_instance {
+                break;
+            }
+            self.remove_files(&dir, metadata).await?;
+            bytes -= metadata.compressed_size;
+            count -= 1;
             removed += 1;
         }
-
-        info!("cleanup removed {removed} archives for {instance_id}");
         Ok(removed)
     }
 
-    /// Removes the archive file and metadata file.
+    async fn remove_pending(&self, instance_id: &str) -> ArchiveResult<()> {
+        let mut entries = tokio::fs::read_dir(self.instance_archives_dir(instance_id)).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".pending-") || name.starts_with(".deleting-") {
+                if !entry.file_type().await?.is_dir() {
+                    return Err(ArchiveError::MetadataParse(
+                        "invalid pending archive".into(),
+                    ));
+                }
+                tokio::fs::remove_dir_all(entry.path()).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn remove_files(&self, archives_dir: &Path, meta: &ArchiveMetadata) -> ArchiveResult<()> {
-        let archive_path = archive_path_for(archives_dir, meta);
-        let meta_path = meta_path_for(archives_dir, meta);
-
-        if archive_path.exists() {
-            tokio::fs::remove_file(&archive_path).await?;
-        }
-        if meta_path.exists() {
-            tokio::fs::remove_file(&meta_path).await?;
-        }
-
+        validate_id(&meta.id)?;
+        let deleting = archives_dir.join(format!(".deleting-{}", meta.id));
+        tokio::fs::rename(archives_dir.join(&meta.id), &deleting).await?;
+        sync_directory(archives_dir)?;
+        tokio::fs::remove_dir_all(deleting).await?;
         Ok(())
     }
 
     /// Detects world directory names from included paths.
-    fn detect_world_names(&self, instance_dir: &Path, include_paths: &[PathBuf]) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-
-        for p in include_paths {
-            if p == Path::new(".") {
-                // For full archives, scan for world dirs
-                // World dirs typically contain level.dat
-                if let Ok(entries) = std::fs::read_dir(instance_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir()
-                            && path.join("level.dat").exists()
-                            && let Some(name) = path.file_name()
-                        {
-                            names.push(name.to_string_lossy().to_string());
-                        }
+    fn detect_world_names(
+        &self,
+        instance_dir: &Path,
+        include_paths: &[PathBuf],
+    ) -> ArchiveResult<Vec<String>> {
+        let mut names = Vec::new();
+        for path in include_paths {
+            if path == Path::new(".") {
+                for entry in std::fs::read_dir(instance_dir)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() && entry.path().join("level.dat").try_exists()? {
+                        names.push(entry.file_name().into_string().map_err(|_| {
+                            ArchiveError::MetadataParse("world name is not UTF-8".into())
+                        })?);
                     }
                 }
-            } else {
-                // Single world dir
-                let full = instance_dir.join(p);
-                if full.is_dir()
-                    && full.join("level.dat").exists()
-                    && let Some(name) = p.file_name()
-                {
-                    names.push(name.to_string_lossy().to_string());
-                }
+            } else if instance_dir.join(path).join("level.dat").try_exists()? {
+                names.push(
+                    path.to_str()
+                        .ok_or_else(|| {
+                            ArchiveError::MetadataParse("world name is not UTF-8".into())
+                        })?
+                        .to_owned(),
+                );
             }
         }
-
-        names
+        names.sort();
+        Ok(names)
     }
 
     /// Infers the archive scope from the selected paths.
@@ -430,6 +655,42 @@ impl ArchiveManager {
             }
         }
     }
+}
+
+async fn finish_pending<T>(pending: &Path, result: ArchiveResult<T>) -> ArchiveResult<T> {
+    let cleanup = match tokio::fs::remove_dir_all(pending).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ArchiveError::from(error)),
+    };
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation), Err(cleanup)) => Err(ArchiveError::Cleanup {
+            operation: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
+pub(crate) fn validate_id(value: &str) -> ArchiveResult<()> {
+    const ID_CHARACTERS: usize = 64;
+    if value.is_empty()
+        || value.len() > ID_CHARACTERS
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(ArchiveError::InvalidId(value.into()));
+    }
+    Ok(())
+}
+fn sync_directory(path: &Path) -> ArchiveResult<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -468,11 +729,12 @@ mod tests {
 
         let meta = manager
             .create(
-                "test-instance",
+                &ArchiveRequest {
+                    game_version: Some("1.20.4"),
+                    ..ArchiveRequest::new("test-instance", "first backup")
+                },
                 &instance_dir,
-                "first backup",
                 InstanceState::Stopped,
-                Some("1.20.4"),
                 &strategy,
             )
             .await
@@ -506,11 +768,12 @@ mod tests {
 
         let result = manager
             .create(
-                "test",
+                &ArchiveRequest {
+                    game_version: None,
+                    ..ArchiveRequest::new("test", "backup")
+                },
                 &instance_dir,
-                "backup",
                 InstanceState::Running,
-                None,
                 &strategy,
             )
             .await;
@@ -540,22 +803,26 @@ mod tests {
 
         let meta = manager
             .create(
-                "test",
+                &ArchiveRequest {
+                    game_version: None,
+                    ..ArchiveRequest::new("test", "backup")
+                },
                 &instance_dir,
-                "backup",
                 InstanceState::Stopped,
-                None,
                 &strategy,
             )
             .await
             .unwrap();
 
         // Verify
-        assert!(manager.verify(&meta.id).await.unwrap());
+        assert!(manager.verify("test", &meta.id).await.unwrap());
 
         // Restore to a new directory
         let restore_dir = tmpdir.path().join("restored");
-        manager.restore(&meta.id, &restore_dir).await.unwrap();
+        manager
+            .restore("test", &meta.id, &restore_dir)
+            .await
+            .unwrap();
 
         assert!(restore_dir.join("world/level.dat").exists());
         assert!(restore_dir.join("server.properties").exists());
@@ -581,11 +848,12 @@ mod tests {
 
         let meta = manager
             .create(
-                "test",
+                &ArchiveRequest {
+                    game_version: None,
+                    ..ArchiveRequest::new("test", "backup")
+                },
                 &instance_dir,
-                "backup",
                 InstanceState::Stopped,
-                None,
                 &strategy,
             )
             .await
@@ -593,7 +861,7 @@ mod tests {
 
         assert_eq!(manager.list("test").await.unwrap().len(), 1);
 
-        manager.delete(&meta.id).await.unwrap();
+        manager.delete("test", &meta.id).await.unwrap();
         assert_eq!(manager.list("test").await.unwrap().len(), 0);
     }
 
@@ -620,11 +888,12 @@ mod tests {
 
             manager
                 .create(
-                    "test",
+                    &ArchiveRequest {
+                        game_version: None,
+                        ..ArchiveRequest::new("test", &format!("backup-{i}"))
+                    },
                     &instance_dir,
-                    &format!("backup-{i}"),
                     InstanceState::Stopped,
-                    None,
                     &strategy,
                 )
                 .await

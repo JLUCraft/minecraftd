@@ -213,16 +213,9 @@ impl MaxRetentionCleanup {
 
         // Archives are sorted oldest-first
         for meta in archives.iter().take(excess) {
-            let archive_path = archive_path_for(archives_dir, meta);
-            let meta_path = meta_path_for(archives_dir, meta);
-
+            super::manager::validate_id(&meta.id)?;
             debug!("removing old archive: {}", meta.id);
-            if archive_path.exists() {
-                tokio::fs::remove_file(&archive_path).await?;
-            }
-            if meta_path.exists() {
-                tokio::fs::remove_file(&meta_path).await?;
-            }
+            tokio::fs::remove_dir_all(archives_dir.join(&meta.id)).await?;
             removed += 1;
         }
 
@@ -304,14 +297,17 @@ impl ArchiveStrategy for TimedArchiveStrategy {
 /// Returns the file path for an archive.
 #[must_use]
 pub fn archive_path_for(archives_dir: &Path, meta: &ArchiveMetadata) -> PathBuf {
-    let extension = meta.algorithm.extension();
-    archives_dir.join(format!("{}.{}", meta.id, extension))
+    archives_dir
+        .join(&meta.id)
+        .join(super::metadata::data_filename(&meta.algorithm))
 }
 
 /// Returns the metadata file path for an archive.
 #[must_use]
 pub fn meta_path_for(archives_dir: &Path, meta: &ArchiveMetadata) -> PathBuf {
-    archives_dir.join(format!("{}.meta.json", meta.id))
+    archives_dir
+        .join(&meta.id)
+        .join(super::metadata::METADATA_FILE)
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -391,9 +387,12 @@ mod tests {
         let mut metas: Vec<ArchiveMetadata> = Vec::new();
         for i in 0..5 {
             let id = format!("archive-{i}");
-            let path = archives_dir.join(format!("{id}.zip"));
+            std::fs::create_dir(archives_dir.join(&id)).unwrap();
+            let path = archives_dir.join(&id).join("data.zip");
             std::fs::write(&path, b"dummy").unwrap();
-            let meta_path = archives_dir.join(format!("{id}.meta.json"));
+            let meta_path = archives_dir
+                .join(&id)
+                .join(crate::archive::metadata::METADATA_FILE);
             std::fs::write(&meta_path, b"{}").unwrap();
 
             metas.push(ArchiveMetadata {

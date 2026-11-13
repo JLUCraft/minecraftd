@@ -21,6 +21,14 @@ use thiserror::Error;
 /// Errors that can occur during archive operations.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveError {
+    #[error("{operation}; pending archive cleanup failed: {cleanup}")]
+    Cleanup {
+        #[source]
+        operation: Box<Self>,
+        cleanup: Box<Self>,
+    },
+    #[error("archive resource quota exceeded")]
+    Quota,
     #[error("archive not found: {0}")]
     NotFound(String),
     #[error("io error: {0}")]

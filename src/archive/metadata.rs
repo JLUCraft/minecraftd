@@ -1,3 +1,12 @@
+/// Maximum serialized archive metadata bytes.
+pub const METADATA_BYTES: u64 = 64 * 1024;
+
+pub(crate) const METADATA_FILE: &str = "metadata.json";
+
+pub(crate) fn data_filename(algorithm: &CompressionAlgorithm) -> String {
+    format!("data.{}", algorithm.extension())
+}
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -5,9 +14,7 @@ use crate::core::state::InstanceState;
 
 /// Metadata persisted alongside each archive.
 ///
-/// Each archive consists of two files:
-/// - `{archive_id}.{ext}` — the compressed archive file
-/// - `{archive_id}.meta.json` — this metadata
+/// An archive directory contains `data.{ext}` and `metadata.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveMetadata {
     /// Unique archive identifier (UUID v7, time-ordered).

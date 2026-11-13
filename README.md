@@ -13,6 +13,16 @@ Process spawns accept the initial output callback before readers start. Output u
 
 `ServerConfig.server_type` controls Java startup flags; universal services do not receive `--nogui`. On Unix, an empty stop command sends SIGTERM, and `^C` sends SIGINT. Stop waits for process exit before releasing the instance. A forced local kill waits for its exit notification. `InstanceService.stop_gracefully` reports the observed exit status and retains ownership when its deadline fails. Native supervisors use `LocalSpawner::with_group_observation` to adopt and wait for Linux descendant exits. A graceful stop preserves unresolved descendants until they exit or an owner requests force termination.
 
+Archive managers use instance-bound IDs and publish each archive directory after
+writing its data and metadata. `ArchiveRequest::new` allocates the identity so a
+host can reserve ownership before publication. `ArchiveLimits` bounds source, compressed and
+expanded bytes and entry counts. Retention enforces per-instance count and byte
+limits. Source links and special files fail creation; extraction rejects links,
+special entries, and paths outside the destination. Missing selected source paths
+fail creation. ZIP and tar.gz preserve empty directories; tar.gz restores file
+permissions. Restore into a caller-owned staging directory before replacing live
+data. Hold exclusive ownership of the archive store across manager processes.
+
 ## Validation
 
 Select one validation channel for a batch and reuse successful results for unchanged inputs. Standard commands:

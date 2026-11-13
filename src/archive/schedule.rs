@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::archive::ArchiveError;
-use crate::archive::manager::ArchiveManager;
+use crate::archive::manager::{ArchiveManager, ArchiveRequest};
 use crate::archive::strategy::ArchiveStrategy;
 use crate::core::state::InstanceState;
 use crate::lifecycle::task::{LifecycleTask, TaskError};
@@ -84,11 +84,12 @@ impl ArchiveScheduleTask {
         match self
             .manager
             .create(
-                instance_id,
+                &ArchiveRequest {
+                    game_version: self.game_version.as_deref(),
+                    ..ArchiveRequest::new(instance_id, &label)
+                },
                 &self.instance_dir,
-                &label,
                 InstanceState::Stopped,
-                self.game_version.as_deref(),
                 self.strategy.as_ref(),
             )
             .await
@@ -152,11 +153,12 @@ impl LifecycleTask for ArchiveScheduleTask {
                 let label = format!("{label_prefix}scheduled");
                 match manager
                     .create(
-                        &instance_id,
+                        &ArchiveRequest {
+                            game_version: game_version.as_deref(),
+                            ..ArchiveRequest::new(&instance_id, &label)
+                        },
                         &instance_dir,
-                        &label,
                         InstanceState::Running,
-                        game_version.as_deref(),
                         strategy.as_ref(),
                     )
                     .await
