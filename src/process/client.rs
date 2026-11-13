@@ -1,5 +1,5 @@
 //! Owned desktop client processes, output capture, readiness and play-time tracking.
-use crate::core::process::{ProcessHandle, ProcessSpec, Signal};
+use crate::core::process::{ProcessHandle, ProcessSpawner, ProcessSpec, Signal};
 use crate::process::local::LocalSpawner;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -82,7 +82,7 @@ impl ClientProcesses {
             on_line(line.trim_end_matches(['\r', '\n']));
         });
         let handle: Arc<dyn ProcessHandle> = LocalSpawner::new()
-            .spawn_with_output(spec, Some(callback))
+            .spawn(spec, Some(callback))
             .await?
             .into();
         let pid = handle.pid().ok_or(ClientProcessError::Unavailable)?;

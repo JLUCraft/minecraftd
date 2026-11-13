@@ -98,6 +98,8 @@ pub struct ProcessSpec {
     pub inherit_env: bool,
 }
 
+pub const OUTPUT_SEGMENT_BYTES: usize = 8192;
+
 /// Type aliases for process callbacks.
 pub type ProcessOutputCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
 pub type ProcessExitCallback = Box<dyn Fn(i32) + Send + Sync>;
@@ -120,5 +122,9 @@ pub trait ProcessHandle: Send + Sync {
 /// Trait for spawning processes.
 #[async_trait]
 pub trait ProcessSpawner: Send + Sync {
-    async fn spawn(&self, spec: &ProcessSpec) -> Result<Box<dyn ProcessHandle>, SpawnError>;
+    async fn spawn(
+        &self,
+        spec: &ProcessSpec,
+        output: Option<ProcessOutputCallback>,
+    ) -> Result<Box<dyn ProcessHandle>, SpawnError>;
 }

@@ -206,20 +206,6 @@ where
 
             let handle = self.core.spawn_process(&spec).await?;
 
-            // Wire up output forwarding to event bus and output ring
-            let bus_id = self.core.id.clone();
-            let bus = self.core.event_bus.clone_boxed();
-            let ring = self.core.output_ring.clone();
-            handle.on_output(Box::new(move |data| {
-                bus.emit(Box::new(crate::core::event::InstanceEvent::Output {
-                    instance_id: bus_id.clone(),
-                    data: data.to_vec(),
-                }));
-                if let Some(r) = &ring {
-                    r.push_bytes(data);
-                }
-            }));
-
             self.core.set_process(handle);
             info!("server instance {} started", self.core.id);
             Ok(())

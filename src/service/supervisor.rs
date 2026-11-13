@@ -364,6 +364,7 @@ mod tests {
         async fn spawn(
             &self,
             _spec: &crate::core::process::ProcessSpec,
+            _output: Option<crate::core::process::ProcessOutputCallback>,
         ) -> Result<Box<dyn crate::core::process::ProcessHandle>, crate::core::process::SpawnError>
         {
             use std::sync::atomic::Ordering::SeqCst;

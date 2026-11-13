@@ -203,14 +203,6 @@ where
 
         let handle = self.core.spawn_process(&spec).await?;
 
-        // Wire up output to ring buffer if configured
-        let ring = self.core.output_ring.clone();
-        handle.on_output(Box::new(move |data| {
-            if let Some(r) = &ring {
-                r.push_bytes(data);
-            }
-        }));
-
         self.core.set_process(handle);
 
         info!("client instance {} launched", self.core.id);

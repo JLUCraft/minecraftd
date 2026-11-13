@@ -1,3 +1,4 @@
+use crate::core::process::OUTPUT_SEGMENT_BYTES;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -32,24 +33,33 @@ impl OutputRingBuffer {
 
     /// Push a raw byte slice into the buffer, splitting on newlines.
     pub fn push_bytes(&self, data: &[u8]) {
-        if let Ok(text) = std::str::from_utf8(data) {
-            self.push_str(text);
-        }
+        self.push_str(&String::from_utf8_lossy(data));
     }
 
     /// Push a string into the buffer, splitting on newlines.
     pub fn push_str(&self, text: &str) {
         let mut guard = self.inner.lock();
         for line in text.lines() {
-            guard.written += 1;
-            if self.capacity == 0 {
-                continue;
+            let mut remaining = line;
+            loop {
+                let mut end = remaining.len().min(OUTPUT_SEGMENT_BYTES);
+                while !remaining.is_char_boundary(end) {
+                    end -= 1;
+                }
+                guard.written += 1;
+                if self.capacity > 0 {
+                    if guard.lines.len() >= self.capacity {
+                        guard.lines.pop_front();
+                    }
+                    guard.lines.push_back(remaining[..end].to_string());
+                }
+                remaining = &remaining[end..];
+                if remaining.is_empty() {
+                    break;
+                }
             }
-            if guard.lines.len() >= self.capacity {
-                guard.lines.pop_front();
-            }
-            guard.lines.push_back(line.to_string());
         }
+        drop(guard);
     }
 
     /// Returns the most recent `n` lines of output.
@@ -165,7 +175,7 @@ mod tests {
         ring.push_bytes(b"a\nb\n");
         ring.push_bytes(&[0xff]);
         assert!(ring.is_empty());
-        assert_eq!(ring.recent_with_offset(1), (2, vec![]));
+        assert_eq!(ring.recent_with_offset(1), (3, vec![]));
     }
 
     #[test]

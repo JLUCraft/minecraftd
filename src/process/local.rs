@@ -1,15 +1,17 @@
 use crate::core::process::{
-    ProcessError, ProcessExitCallback, ProcessHandle, ProcessOutputCallback, ProcessSpec, Signal,
-    SpawnError,
+    OUTPUT_SEGMENT_BYTES, ProcessError, ProcessExitCallback, ProcessHandle, ProcessOutputCallback,
+    ProcessSpec, Signal, SpawnError,
 };
 use async_trait::async_trait;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, trace};
+
+const OUTPUT_QUEUE_CAPACITY: usize = 64;
 
 pub struct LocalProcessHandle {
     pid: u32,
@@ -35,7 +37,7 @@ impl LocalProcessHandle {
     fn new(
         pid: u32,
         stdin: tokio::process::ChildStdin,
-        output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        output_rx: mpsc::Receiver<Vec<u8>>,
         exit_rx: mpsc::UnboundedReceiver<i32>,
         output_callbacks: Arc<Mutex<Vec<ProcessOutputCallback>>>,
         exit_callbacks: Arc<Mutex<Vec<ProcessExitCallback>>>,
@@ -102,47 +104,67 @@ impl LocalProcessHandle {
         }
     }
 
-    async fn spawn_readers(
+    fn utf8_suffix(data: &[u8], keep_last_complete: bool) -> usize {
+        let end = if keep_last_complete && data.last() == Some(&b'\r') {
+            data.len() - 1
+        } else {
+            data.len()
+        };
+        let start = data[..end]
+            .iter()
+            .rposition(|byte| byte & 0b1100_0000 != 0b1000_0000)
+            .unwrap_or(0);
+        match std::str::from_utf8(&data[start..]) {
+            Err(error) if error.error_len().is_none() => data.len() - start,
+            Ok(_) if keep_last_complete => data.len() - start,
+            _ => 0,
+        }
+    }
+
+    async fn read_output<R: AsyncRead + Unpin>(source: R, output: mpsc::Sender<Vec<u8>>) {
+        let mut reader = BufReader::new(source);
+        let mut pending = Vec::with_capacity(OUTPUT_SEGMENT_BYTES);
+        loop {
+            let remaining = OUTPUT_SEGMENT_BYTES - pending.len();
+            match (&mut reader)
+                .take(remaining as u64)
+                .read_until(b'\n', &mut pending)
+                .await
+            {
+                Ok(0) => {
+                    if !pending.is_empty() {
+                        let _ = output.send(pending).await;
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    let keep_last =
+                        pending.len() == OUTPUT_SEGMENT_BYTES && pending.last() != Some(&b'\n');
+                    let split = pending.len() - Self::utf8_suffix(&pending, keep_last);
+                    if split == 0 {
+                        continue;
+                    }
+                    let suffix = pending.split_off(split);
+                    let segment = std::mem::replace(&mut pending, suffix);
+                    if output.send(segment).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    trace!(%error,"process output read failed");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn spawn_readers(
         stdout: tokio::process::ChildStdout,
         stderr: tokio::process::ChildStderr,
-        output_tx: mpsc::UnboundedSender<Vec<u8>>,
+        output: mpsc::Sender<Vec<u8>>,
     ) {
-        let stdout_tx = output_tx.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = stdout_tx.send(line.clone());
-                    }
-                    Err(e) => {
-                        trace!("stdout read error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = output_tx.send(line.clone());
-                    }
-                    Err(e) => {
-                        trace!("stderr read error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(Self::read_output(stdout, output.clone()));
+        tokio::spawn(Self::read_output(stderr, output));
     }
 }
 
@@ -187,10 +209,7 @@ impl ProcessHandle for LocalProcessHandle {
                 Ok(()) => {}
                 // The process group can exit between the running check and the
                 // signal; stopping an already dead process is a success.
-                Err(nix::errno::Errno::ESRCH) => {
-                    self.running.store(false, Ordering::SeqCst);
-                    return Ok(());
-                }
+                Err(nix::errno::Errno::ESRCH) => {}
                 Err(error) => return Err(ProcessError::KillFailed(error.to_string())),
             }
         }
@@ -276,13 +295,7 @@ impl LocalSpawner {
 
 #[async_trait]
 impl crate::core::process::ProcessSpawner for LocalSpawner {
-    async fn spawn(&self, spec: &ProcessSpec) -> Result<Box<dyn ProcessHandle>, SpawnError> {
-        self.spawn_with_output(spec, None).await
-    }
-}
-impl LocalSpawner {
-    /// Install the output consumer before starting readers, including for short-lived children.
-    pub async fn spawn_with_output(
+    async fn spawn(
         &self,
         spec: &ProcessSpec,
         output: Option<ProcessOutputCallback>,
@@ -327,7 +340,7 @@ impl LocalSpawner {
             .take()
             .ok_or_else(|| SpawnError::SpawnFailed("no stdin".into()))?;
 
-        let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
         let (exit_tx, exit_rx) = mpsc::unbounded_channel::<i32>();
 
         let output_callbacks: Arc<Mutex<Vec<ProcessOutputCallback>>> =
@@ -346,10 +359,9 @@ impl LocalSpawner {
             exit_watch_rx,
         );
 
-        LocalProcessHandle::spawn_readers(stdout, stderr, output_tx).await;
+        LocalProcessHandle::spawn_readers(stdout, stderr, output_tx);
 
         let running = handle.running.clone();
-        let exit_tx2 = exit_tx.clone();
         tokio::spawn(async move {
             let exit_code = match child.wait().await {
                 Ok(status) => status.code().unwrap_or(-1),
@@ -369,7 +381,7 @@ impl LocalSpawner {
             }
             let _ = output_task.await;
             running.store(false, Ordering::SeqCst);
-            let _ = exit_tx2.send(exit_code);
+            let _ = exit_tx.send(exit_code);
             let _ = exit_watch_tx.send(Some(exit_code));
         });
 
@@ -384,6 +396,68 @@ mod tests {
     use crate::core::process::ProcessSpawner;
 
     #[tokio::test]
+    async fn prewired_output_drains_short_lived_children_in_bounded_segments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FIRST: &str = "initial\n";
+        const LAST: &str = "界🙂final";
+        let flood = OUTPUT_SEGMENT_BYTES * 4 - 4;
+        let terminated_line = OUTPUT_SEGMENT_BYTES - 1;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&captured);
+        let ring = crate::core::ring::OutputRingBuffer::new(2);
+        let output_ring = ring.clone();
+        let spec = ProcessSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "printf '{FIRST}'; head -c {flood} /dev/zero; printf '{LAST}\r\n'; head -c {terminated_line} /dev/zero; printf '\r\n'"
+                ),
+            ],
+            ..Default::default()
+        };
+        let handle = LocalSpawner::new()
+            .spawn(
+                &spec,
+                Some(Box::new(move |data| {
+                    assert!(data.len() <= OUTPUT_SEGMENT_BYTES);
+                    assert!(std::str::from_utf8(data).is_ok());
+                    if let Ok(mut bytes) = collected.lock() {
+                        bytes.extend_from_slice(data);
+                    }
+                    output_ring.push_bytes(data);
+                })),
+            )
+            .await?;
+        let mut exited = handle.exit_watch().ok_or("process exit watch missing")?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while exited.borrow().is_none() {
+                exited.changed().await?;
+            }
+            Ok::<_, tokio::sync::watch::error::RecvError>(())
+        })
+        .await??;
+        let bytes = captured.lock().map_err(|_| "output lock poisoned")?;
+        assert!(bytes.starts_with(FIRST.as_bytes()));
+        assert_eq!(
+            &bytes[FIRST.len() + flood..FIRST.len() + flood + LAST.len()],
+            LAST.as_bytes()
+        );
+        assert_eq!(
+            bytes.len(),
+            FIRST.len() + flood + LAST.len() + terminated_line + 4
+        );
+        drop(bytes);
+        assert_eq!(ring.len(), 2);
+        assert!(
+            ring.all_lines()
+                .iter()
+                .all(|line| !line.is_empty() && line.len() <= OUTPUT_SEGMENT_BYTES)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_local_spawner_echo() {
         let spawner = LocalSpawner::new();
         let spec = ProcessSpec {
@@ -391,7 +465,7 @@ mod tests {
             args: vec!["hello".into()],
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
         assert!(handle.pid().is_some());
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
@@ -403,7 +477,7 @@ mod tests {
             command: "cat".into(),
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
         handle.write(b"hello world\n").await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         handle.kill(Signal::Term).await.unwrap();
@@ -417,7 +491,7 @@ mod tests {
             args: vec!["callback_test".into()],
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let out = output.clone();
@@ -438,7 +512,7 @@ mod tests {
             command: "true".into(),
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
 
         let exited = Arc::new(AtomicBool::new(false));
         let ex = exited.clone();
@@ -457,7 +531,7 @@ mod tests {
             command: "true".into(),
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
         // Wait for process to exit
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         let result = handle.write(b"data\n").await;
@@ -471,7 +545,7 @@ mod tests {
             command: "true".into(),
             ..Default::default()
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         let result = handle.kill(Signal::Kill).await;
         assert!(matches!(result, Err(ProcessError::AlreadyExited)));
@@ -488,7 +562,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             inherit_env: true,
         };
-        let handle = spawner.spawn(&spec).await.unwrap();
+        let handle = spawner.spawn(&spec, None).await.unwrap();
         assert!(handle.is_running());
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
@@ -503,7 +577,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             inherit_env: false,
         };
-        let _handle = spawner.spawn(&spec).await.unwrap();
+        let _handle = spawner.spawn(&spec, None).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
@@ -514,7 +588,7 @@ mod tests {
             command: "/nonexistent/command_xyz".into(),
             ..Default::default()
         };
-        let result = spawner.spawn(&spec).await;
+        let result = spawner.spawn(&spec, None).await;
         assert!(result.is_err());
     }
 
@@ -532,7 +606,7 @@ mod tests {
             cwd: Some(directory.path().to_path_buf()),
             ..Default::default()
         };
-        let handle = LocalSpawner::new().spawn(&spec).await.unwrap();
+        let handle = LocalSpawner::new().spawn(&spec, None).await.unwrap();
         let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(contents) =

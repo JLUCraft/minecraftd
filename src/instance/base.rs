@@ -240,7 +240,19 @@ where
         &self,
         spec: &ProcessSpec,
     ) -> Result<Box<dyn ProcessHandle>, InstanceError> {
-        let handle = self.spawner.spawn(spec).await?;
+        let bus = self.event_bus.clone_boxed();
+        let instance_id = self.id.clone();
+        let ring = self.output_ring.clone();
+        let output = Box::new(move |data: &[u8]| {
+            bus.emit(Box::new(InstanceEvent::Output {
+                instance_id: instance_id.clone(),
+                data: data.to_vec(),
+            }));
+            if let Some(ring) = &ring {
+                ring.push_bytes(data);
+            }
+        });
+        let handle = self.spawner.spawn(spec, Some(output)).await?;
         Ok(handle)
     }
 }
