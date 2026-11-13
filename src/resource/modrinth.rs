@@ -155,13 +155,12 @@ impl<C: ResourceTransport> ModrinthClient<C> {
                 facets.push(vec![format!("categories:{cat}")]);
             }
         }
-        params.insert(
-            "facets".to_string(),
-            serde_json::to_string(&facets).unwrap_or_default(),
-        );
+        params.insert("facets".to_string(), serde_json::to_string(&facets)?);
         params.insert("offset".to_string(), query.offset.to_string());
         params.insert("limit".to_string(), query.limit.to_string());
-        params.insert("index".to_string(), query.index.clone());
+        if !query.index.is_empty() {
+            params.insert("index".to_string(), query.index.clone());
+        }
 
         let response = self.client.request_json(&url, &params, None, None).await?;
 
