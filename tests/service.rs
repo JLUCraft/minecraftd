@@ -144,3 +144,33 @@ async fn test_service_restart_command() {
 
     service.shutdown().await.unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn graceful_stop_reports_exit_after_publishing_stopped_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = InstanceBuilder::new(
+        "graceful-service".into(),
+        InstancePath::new(directory.path()),
+    )
+    .spawner(LocalSpawner::with_group_observation().unwrap())
+    .event_bus(TokioBroadcastBus::new())
+    .build_server(ServerConfig {
+        start_command: "sh -c 'read line; echo clean-stop; exit 23'".into(),
+        stop_command: "stop".into(),
+        ..Default::default()
+    });
+    let service = InstanceService::new(server, RestartPolicy::never());
+    service.start().await.unwrap();
+    assert_eq!(service.stop_gracefully().await.unwrap(), Some(23));
+    assert_eq!(service.state(), InstanceState::Stopped);
+    assert!(
+        service
+            .recent_output(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("clean-stop"))
+    );
+    service.shutdown().await.unwrap();
+}

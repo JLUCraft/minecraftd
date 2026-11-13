@@ -10,6 +10,10 @@ pub enum ProcessError {
     WriteFailed(String),
     #[error("failed to kill process: {0}")]
     KillFailed(String),
+    #[error("failed to observe process group exit: {0}")]
+    WaitFailed(String),
+    #[error("graceful process-group exit is unsupported")]
+    GracefulExitUnsupported,
     #[error("process already exited")]
     AlreadyExited,
 }
@@ -110,6 +114,10 @@ pub trait ProcessHandle: Send + Sync {
     fn pid(&self) -> Option<u32>;
     async fn write(&self, data: &[u8]) -> Result<(), ProcessError>;
     async fn kill(&self, signal: Signal) -> Result<(), ProcessError>;
+    /// Preserve descendants while a graceful stop drains their output and exit.
+    fn require_graceful_exit(&self) -> Result<(), ProcessError> {
+        Err(ProcessError::GracefulExitUnsupported)
+    }
     fn on_output(&self, callback: ProcessOutputCallback);
     fn on_exit(&self, callback: ProcessExitCallback);
     fn is_running(&self) -> bool;

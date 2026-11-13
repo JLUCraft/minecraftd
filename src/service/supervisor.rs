@@ -101,12 +101,19 @@ impl<I: Instance + Debug> Supervisor<I> {
                         msg => (msg, None),
                     };
                     let shutdown = matches!(msg, ControlMsg::Shutdown);
+                    let mut graceful_reply = None;
                     let result = match msg {
                         ControlMsg::Start => self.handle_start(&mut exit_watch).await,
                         ControlMsg::Stop => {
                             let result = self.handle_stop().await;
                             if result.is_ok() { exit_watch = None; }
                             result
+                        }
+                        ControlMsg::StopGracefully(sender) => {
+                            let result = self.handle_stop_gracefully().await;
+                            if result.is_ok() { exit_watch = None; }
+                            graceful_reply = Some((sender, result.clone()));
+                            result.map(|_| ())
                         }
                         ControlMsg::Kill => {
                             let result = self.handle_kill().await;
@@ -136,6 +143,9 @@ impl<I: Instance + Debug> Supervisor<I> {
                     };
                     // Publish before acknowledging so callers observe the completed operation.
                     let _ = self.shared_state.send(self.instance.lock().await.state());
+                    if let Some((sender, result)) = graceful_reply {
+                        let _ = sender.send(result);
+                    }
                     let completed = result.is_ok();
                     if let Some(reply) = reply {
                         let _ = reply.send(result);
@@ -242,6 +252,17 @@ impl<I: Instance + Debug> Supervisor<I> {
             return Ok(());
         }
         inst.stop().await
+    }
+
+    async fn handle_stop_gracefully(&self) -> Result<Option<i32>, InstanceError> {
+        let mut instance = self.instance.lock().await;
+        if !instance.is_stoppable() {
+            if instance.process_handle().is_some() {
+                return Err(InstanceError::NotStoppable(instance.state()));
+            }
+            return Ok(None);
+        }
+        instance.stop_gracefully().await
     }
 
     async fn handle_kill(&self) -> Result<(), InstanceError> {

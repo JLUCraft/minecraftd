@@ -12,6 +12,8 @@ pub enum ControlMsg {
     Start,
     /// Request to stop the instance gracefully.
     Stop,
+    /// Wait for graceful exit and return its observed status; None means already stopped.
+    StopGracefully(oneshot::Sender<Result<Option<i32>, crate::instance::base::InstanceError>>),
     /// Request to kill the instance immediately.
     Kill,
     /// Request to restart the instance.

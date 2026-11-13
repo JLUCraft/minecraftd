@@ -43,6 +43,10 @@ pub trait Instance: Send + Sync + Debug {
     }
     async fn start(&mut self) -> Result<(), InstanceError>;
     async fn stop(&mut self) -> Result<(), InstanceError>;
+    /// Stop through observed exit, returning its status and retaining ownership on failure.
+    async fn stop_gracefully(&mut self) -> Result<Option<i32>, InstanceError> {
+        Err(InstanceError::NotImplemented)
+    }
     async fn kill(&mut self) -> Result<(), InstanceError>;
     async fn restart(&mut self) -> Result<(), InstanceError> {
         self.stop().await?;

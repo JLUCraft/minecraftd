@@ -123,6 +123,19 @@ impl InstanceService {
         self.send_control(ControlMsg::Stop).await
     }
 
+    /// Stop through observed exit, retaining a process that misses the deadline.
+    pub async fn stop_gracefully(&self) -> Result<Option<i32>, InstanceServiceError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.control_tx
+            .send(ControlMsg::StopGracefully(reply))
+            .await
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)?;
+        received
+            .await
+            .map_err(|_| InstanceServiceError::SupervisorShutdown)?
+            .map_err(InstanceServiceError::from)
+    }
+
     /// Kill the instance immediately.
     pub async fn kill(&self) -> Result<(), InstanceServiceError> {
         self.send_control(ControlMsg::Kill).await

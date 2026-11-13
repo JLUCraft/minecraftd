@@ -17,6 +17,8 @@ pub struct LocalProcessHandle {
     pid: u32,
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     running: Arc<AtomicBool>,
+    cleanup_group: Arc<AtomicBool>,
+    observe_groups: bool,
     output_callbacks: Arc<Mutex<Vec<ProcessOutputCallback>>>,
     exit_callbacks: Arc<Mutex<Vec<ProcessExitCallback>>>,
     /// Watch channel for process exit code. None = not exited yet, Some(code) = exited.
@@ -74,6 +76,8 @@ impl LocalProcessHandle {
                 pid,
                 stdin: tokio::sync::Mutex::new(stdin),
                 running,
+                cleanup_group: Arc::new(AtomicBool::new(true)),
+                observe_groups: false,
                 output_callbacks,
                 exit_callbacks,
                 exit_watch,
@@ -262,6 +266,13 @@ impl ProcessHandle for LocalProcessHandle {
         Ok(())
     }
 
+    fn require_graceful_exit(&self) -> Result<(), ProcessError> {
+        if !self.observe_groups {
+            return Err(ProcessError::GracefulExitUnsupported);
+        }
+        self.cleanup_group.store(false, Ordering::SeqCst);
+        Ok(())
+    }
     fn on_output(&self, callback: ProcessOutputCallback) {
         if let Ok(mut cbs) = self.output_callbacks.lock() {
             cbs.push(callback);
@@ -291,6 +302,19 @@ impl LocalSpawner {
     pub const fn new() -> Self {
         Self
     }
+    /// Initialize Linux descendant observation before spawning local services.
+    pub fn with_group_observation() -> Result<Self, SpawnError> {
+        #[cfg(target_os = "linux")]
+        {
+            nix::sys::prctl::set_child_subreaper(true)
+                .map_err(|error| SpawnError::SpawnFailed(error.to_string()))?;
+            Ok(Self)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(SpawnError::SpawnFailed(
+            "descendant exit observation is unavailable".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -300,6 +324,9 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
         spec: &ProcessSpec,
         output: Option<ProcessOutputCallback>,
     ) -> Result<Box<dyn ProcessHandle>, SpawnError> {
+        #[cfg(target_os = "linux")]
+        let observe_groups = nix::sys::prctl::get_child_subreaper()
+            .map_err(|error| SpawnError::SpawnFailed(error.to_string()))?;
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
             .kill_on_drop(true)
@@ -359,9 +386,16 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
             exit_watch_rx,
         );
 
+        #[cfg(target_os = "linux")]
+        let handle = LocalProcessHandle {
+            observe_groups,
+            ..handle
+        };
         LocalProcessHandle::spawn_readers(stdout, stderr, output_tx);
 
         let running = handle.running.clone();
+        #[cfg(unix)]
+        let cleanup_group = handle.cleanup_group.clone();
         tokio::spawn(async move {
             let exit_code = match child.wait().await {
                 Ok(status) => status.code().unwrap_or(-1),
@@ -372,13 +406,31 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
             };
             // A wrapper can exit before its JVM; release the whole owned group.
             #[cfg(unix)]
-            if let Err(error) = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            ) && error != nix::errno::Errno::ESRCH
+            if cleanup_group.load(Ordering::SeqCst)
+                && let Err(error) = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                )
+                && error != nix::errno::Errno::ESRCH
             {
                 tracing::warn!(%error, "process group cleanup failed");
             }
+            #[cfg(target_os = "linux")]
+            let exit_code = if observe_groups {
+                match tokio::task::spawn_blocking(move || wait_group(pid, exit_code)).await {
+                    Ok(Ok(code)) => code,
+                    Ok(Err(error)) => {
+                        tracing::error!(%error,"process group exit observation failed");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error,"process group wait task failed");
+                        return;
+                    }
+                }
+            } else {
+                exit_code
+            };
             let _ = output_task.await;
             running.store(false, Ordering::SeqCst);
             let _ = exit_tx.send(exit_code);
@@ -387,6 +439,33 @@ impl crate::core::process::ProcessSpawner for LocalSpawner {
 
         debug!("spawned local process pid={}", pid);
         Ok(Box::new(handle))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_group(group: u32, mut code: i32) -> Result<i32, ProcessError> {
+    use nix::{
+        errno::Errno,
+        sys::wait::{WaitStatus, waitpid},
+        unistd::Pid,
+    };
+    loop {
+        match waitpid(Pid::from_raw(-(group as i32)), None) {
+            Ok(WaitStatus::Exited(_, status)) => {
+                if code == 0 {
+                    code = status;
+                }
+            }
+            Ok(WaitStatus::Signaled(..)) => {
+                if code == 0 {
+                    code = -1;
+                }
+            }
+            Ok(_) => {}
+            Err(Errno::EINTR) => {}
+            Err(Errno::ECHILD) => return Ok(code),
+            Err(error) => return Err(ProcessError::WaitFailed(error.to_string())),
+        }
     }
 }
 

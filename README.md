@@ -11,7 +11,7 @@ Download plans use `download::request::DownloadParam` for ordered source URLs, d
 Process spawns accept the initial output callback before readers start. Output uses a bounded queue and segments of at most 8 KiB. Ring buffers split long lines into bounded segments and render invalid UTF-8 with replacement characters. `OutputRingBuffer::recent_with_offset` and `InstanceService::recent_output_with_offset` return the global first-segment index and captured text. The counter includes evicted segments, is shared by clones, and survives clearing.
 
 
-`ServerConfig.server_type` controls Java startup flags; universal services do not receive `--nogui`. On Unix, an empty stop command sends SIGTERM, and `^C` sends SIGINT. Stop waits for process exit before releasing the instance. A forced local kill waits for its exit notification.
+`ServerConfig.server_type` controls Java startup flags; universal services do not receive `--nogui`. On Unix, an empty stop command sends SIGTERM, and `^C` sends SIGINT. Stop waits for process exit before releasing the instance. A forced local kill waits for its exit notification. `InstanceService.stop_gracefully` reports the observed exit status and retains ownership when its deadline fails. Native supervisors use `LocalSpawner::with_group_observation` to adopt and wait for Linux descendant exits. A graceful stop preserves unresolved descendants until they exit or an owner requests force termination.
 
 ## Validation
 

@@ -54,6 +54,12 @@ pub struct RconConfig {
     pub host: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopPolicy {
+    Graceful,
+    Escalate,
+}
+
 /// A Minecraft server instance.
 ///
 /// Generic over spawner `S` and event bus `E`, enabling compile-time composition
@@ -90,14 +96,130 @@ where
         self.config.get_mut()
     }
 
-    fn termination_failed(
+    fn termination_failed<T>(
         &mut self,
         error: crate::core::process::ProcessError,
-    ) -> Result<(), InstanceError> {
+    ) -> Result<T, InstanceError> {
         self.core.state_machine.transition(InstanceState::Error(
             crate::core::state::InstanceError::new("termination_failed".into(), error.to_string()),
         ))?;
         Err(error.into())
+    }
+
+    async fn stop_with_policy(&mut self, policy: StopPolicy) -> Result<Option<i32>, InstanceError> {
+        self.core.acquire_lock()?;
+
+        if !self.is_stoppable() {
+            return Err(InstanceError::NotStoppable(self.state()));
+        }
+
+        if policy == StopPolicy::Graceful {
+            let process = self
+                .core
+                .process
+                .as_ref()
+                .ok_or_else(|| InstanceError::NotStoppable(self.state()))?;
+            process.require_graceful_exit()?;
+            if self.core.exit_watch.is_none() {
+                return Err(InstanceError::Lifecycle(
+                    "process exit observation unavailable".into(),
+                ));
+            }
+            #[cfg(windows)]
+            if self.config.get().stop_command.is_empty() || self.config.get().stop_command == "^C" {
+                return Err(InstanceError::Lifecycle(
+                    "configure a console command for graceful stop".into(),
+                ));
+            }
+        }
+        self.core
+            .state_machine
+            .transition(InstanceState::Stopping)?;
+
+        let cfg = self.config.get().clone();
+
+        if let Some(process) = &self.core.process {
+            if cfg.stop_command.is_empty() || cfg.stop_command == "^C" {
+                let signal = if cfg.stop_command == "^C" {
+                    Signal::Int
+                } else {
+                    Signal::Term
+                };
+                if let Err(error) = process.kill(signal).await
+                    && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+                {
+                    return self.termination_failed(error);
+                }
+            } else {
+                let cmd = format!("{}\n", cfg.stop_command);
+                if let Err(error) = process.write(cmd.as_bytes()).await {
+                    if policy == StopPolicy::Graceful {
+                        return self.termination_failed(error);
+                    }
+                    warn!(%error, "failed to send stop command");
+                }
+            }
+        }
+
+        let mut exit = self.core.exit_watch.clone();
+        let observed = tokio::time::timeout(
+            tokio::time::Duration::from_secs(DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS),
+            async {
+                match &mut exit {
+                    Some(receiver) => loop {
+                        let code = *receiver.borrow();
+                        if let Some(code) = code {
+                            return Some(code);
+                        }
+                        if receiver.changed().await.is_err() {
+                            return None;
+                        }
+                    },
+                    None => std::future::pending::<Option<i32>>().await,
+                }
+            },
+        )
+        .await
+        .ok()
+        .flatten();
+        if policy == StopPolicy::Graceful && observed.is_none() {
+            self.core.state_machine.transition(InstanceState::Error(
+                crate::core::state::InstanceError::new(
+                    "graceful_stop_failed".into(),
+                    "graceful stop deadline elapsed or exit observation closed".into(),
+                ),
+            ))?;
+            return Err(InstanceError::Lifecycle(
+                "graceful stop did not complete".into(),
+            ));
+        }
+
+        if let Some(process) = &self.core.process
+            && process.is_running()
+        {
+            if policy == StopPolicy::Graceful {
+                return Err(InstanceError::Lifecycle(
+                    "process remains active after exit observation".into(),
+                ));
+            }
+            warn!("server did not stop gracefully, force killing");
+            if let Err(error) = process.kill(Signal::Kill).await
+                && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+            {
+                return self.termination_failed(error);
+            }
+        }
+
+        let id = self.core.id.clone();
+        self.core.lifecycle.run_stop_hooks(&id).await;
+        let code = exit
+            .as_ref()
+            .and_then(|receiver| *receiver.borrow())
+            .or(observed);
+        self.core.clear_process(code.unwrap_or(0));
+
+        info!("server instance {} stopped", self.core.id);
+        Ok(code)
     }
 
     /// Builds the process specification with JVM isolation.
@@ -221,78 +343,12 @@ where
     }
 
     async fn stop(&mut self) -> Result<(), InstanceError> {
-        self.core.acquire_lock()?;
-
-        if !self.is_stoppable() {
-            return Err(InstanceError::NotStoppable(self.state()));
-        }
-
-        self.core
-            .state_machine
-            .transition(InstanceState::Stopping)?;
-
-        let cfg = self.config.get().clone();
-
-        if let Some(process) = &self.core.process {
-            if cfg.stop_command.is_empty() || cfg.stop_command == "^C" {
-                let signal = if cfg.stop_command == "^C" {
-                    Signal::Int
-                } else {
-                    Signal::Term
-                };
-                if let Err(error) = process.kill(signal).await
-                    && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
-                {
-                    return self.termination_failed(error);
-                }
-            } else {
-                let cmd = format!("{}\n", cfg.stop_command);
-                if let Err(error) = process.write(cmd.as_bytes()).await {
-                    warn!(%error, "failed to send stop command");
-                }
-            }
-        }
-
-        let mut exit = self.core.exit_watch.clone();
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS),
-            async {
-                match &mut exit {
-                    Some(receiver) => loop {
-                        if receiver.borrow().is_some() {
-                            return;
-                        }
-                        if receiver.changed().await.is_err() {
-                            return;
-                        }
-                    },
-                    None => std::future::pending::<()>().await,
-                }
-            },
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(_) => debug!("graceful stop deadline elapsed"),
-        }
-
-        if let Some(process) = &self.core.process
-            && process.is_running()
-        {
-            warn!("server did not stop gracefully, force killing");
-            if let Err(error) = process.kill(Signal::Kill).await
-                && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
-            {
-                return self.termination_failed(error);
-            }
-        }
-
-        let id = self.core.id.clone();
-        self.core.lifecycle.run_stop_hooks(&id).await;
-        self.core.clear_process(0);
-
-        info!("server instance {} stopped", self.core.id);
-        Ok(())
+        self.stop_with_policy(StopPolicy::Escalate)
+            .await
+            .map(|_| ())
+    }
+    async fn stop_gracefully(&mut self) -> Result<Option<i32>, InstanceError> {
+        self.stop_with_policy(StopPolicy::Graceful).await
     }
 
     async fn kill(&mut self) -> Result<(), InstanceError> {
