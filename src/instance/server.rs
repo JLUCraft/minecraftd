@@ -90,6 +90,16 @@ where
         self.config.get_mut()
     }
 
+    fn termination_failed(
+        &mut self,
+        error: crate::core::process::ProcessError,
+    ) -> Result<(), InstanceError> {
+        self.core.state_machine.transition(InstanceState::Error(
+            crate::core::state::InstanceError::new("termination_failed".into(), error.to_string()),
+        ))?;
+        Err(error.into())
+    }
+
     /// Builds the process specification with JVM isolation.
     ///
     /// The working directory is derived from the instance's [`InstancePath`],
@@ -112,8 +122,9 @@ where
         let command = parts[0].clone();
         let mut args = parts[1..].to_vec();
 
-        // Server daemon always runs headless — suppress the Minecraft GUI.
-        args.push("--nogui".to_string());
+        if cfg.server_type == "minecraft/java" {
+            args.push("--nogui".to_string());
+        }
 
         // Apply JVM isolation properties
         if cfg.isolated_tmpdir {
@@ -161,11 +172,13 @@ where
     }
 
     fn is_startable(&self) -> bool {
-        self.core.state_machine.is_operable() && self.core.state_machine.is_terminal()
+        self.core.process.is_none()
+            && self.core.state_machine.is_operable()
+            && self.core.state_machine.is_terminal()
     }
 
     fn is_stoppable(&self) -> bool {
-        self.core.state_machine.is_running()
+        self.core.process.is_some()
     }
 
     async fn start(&mut self) -> Result<(), InstanceError> {
@@ -234,28 +247,58 @@ where
 
         let cfg = self.config.get().clone();
 
-        // Try graceful stop via stdin
-        if !cfg.stop_command.is_empty()
-            && cfg.stop_command != "^C"
-            && let Some(process) = &self.core.process
-        {
-            let cmd = format!("{}\n", cfg.stop_command);
-            if let Err(e) = process.write(cmd.as_bytes()).await {
-                warn!("failed to send stop command: {}", e);
+        if let Some(process) = &self.core.process {
+            if cfg.stop_command.is_empty() || cfg.stop_command == "^C" {
+                let signal = if cfg.stop_command == "^C" {
+                    Signal::Int
+                } else {
+                    Signal::Term
+                };
+                if let Err(error) = process.kill(signal).await
+                    && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+                {
+                    return self.termination_failed(error);
+                }
+            } else {
+                let cmd = format!("{}\n", cfg.stop_command);
+                if let Err(error) = process.write(cmd.as_bytes()).await {
+                    warn!(%error, "failed to send stop command");
+                }
             }
         }
 
-        // Wait for graceful shutdown, then force kill
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS,
-        ))
-        .await;
+        let mut exit = self.core.exit_watch.clone();
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS),
+            async {
+                match &mut exit {
+                    Some(receiver) => loop {
+                        if receiver.borrow().is_some() {
+                            return;
+                        }
+                        if receiver.changed().await.is_err() {
+                            return;
+                        }
+                    },
+                    None => std::future::pending::<()>().await,
+                }
+            },
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => debug!("graceful stop deadline elapsed"),
+        }
 
         if let Some(process) = &self.core.process
             && process.is_running()
         {
             warn!("server did not stop gracefully, force killing");
-            process.kill(Signal::Kill).await?;
+            if let Err(error) = process.kill(Signal::Kill).await
+                && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+            {
+                return self.termination_failed(error);
+            }
         }
 
         let id = self.core.id.clone();
@@ -277,8 +320,11 @@ where
             .state_machine
             .transition(InstanceState::Stopping)?;
 
-        if let Some(process) = &self.core.process {
-            process.kill(Signal::Kill).await?;
+        if let Some(process) = &self.core.process
+            && let Err(error) = process.kill(Signal::Kill).await
+            && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+        {
+            return self.termination_failed(error);
         }
 
         let id = self.core.id.clone();
@@ -371,7 +417,8 @@ mod tests {
         let server = ServerInstance::with_core(
             core,
             ServerConfig {
-                start_command: "java -jar server.jar nogui".into(),
+                server_type: "minecraft/java".into(),
+                start_command: "java -jar server.jar".into(),
                 isolated_tmpdir: true,
                 jvm_properties: vec![("foo".into(), "bar".into())],
                 ..Default::default()
@@ -380,6 +427,7 @@ mod tests {
 
         let spec = server.build_process_spec().unwrap();
         assert_eq!(spec.command, "java");
+        assert!(spec.args.contains(&"--nogui".to_string()));
         assert!(spec.args.contains(&"-jar".to_string()));
         assert!(spec.args.iter().any(|a| a.starts_with("-Djava.io.tmpdir=")));
         assert!(spec.args.iter().any(|a| a == "-Dfoo=bar"));
@@ -398,7 +446,8 @@ mod tests {
         let server = ServerInstance::with_core(
             core,
             ServerConfig {
-                start_command: "java -jar server.jar".into(),
+                server_type: "universal".into(),
+                start_command: "federated-server run --config host.json".into(),
                 ..Default::default()
             },
         );
@@ -406,6 +455,7 @@ mod tests {
         let spec = server.build_process_spec().unwrap();
         assert!(!spec.args.iter().any(|a| a.starts_with("-Djava.io.tmpdir=")));
         assert!(spec.env.is_empty());
+        assert_eq!(spec.args, ["run", "--config", "host.json"]);
     }
 
     #[tokio::test]

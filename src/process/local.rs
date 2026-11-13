@@ -229,7 +229,17 @@ impl ProcessHandle for LocalProcessHandle {
             }
         }
 
-        self.running.store(false, Ordering::SeqCst);
+        if matches!(signal, Signal::Kill) || cfg!(windows) {
+            let mut exit = self.exit_watch.clone();
+            loop {
+                if exit.borrow().is_some() {
+                    break;
+                }
+                exit.changed()
+                    .await
+                    .map_err(|error| ProcessError::KillFailed(error.to_string()))?;
+            }
+        }
         Ok(())
     }
 
@@ -279,6 +289,7 @@ impl LocalSpawner {
     ) -> Result<Box<dyn ProcessHandle>, SpawnError> {
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::piped());

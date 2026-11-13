@@ -10,6 +10,8 @@ Download plans use `download::request::DownloadParam` for ordered source URLs, d
 
 `OutputRingBuffer::recent_with_offset` and `InstanceService::recent_output_with_offset` return a window's zero-based global first-line index and its lines. The index counts all written lines, including evicted lines, and is shared by buffer clones. Empty windows return the next write index. Clearing the buffer preserves the counter; a new buffer starts at zero. Existing line-only queries remain available.
 
+`ServerConfig.server_type` controls Java startup flags; universal services do not receive `--nogui`. On Unix, an empty stop command sends SIGTERM, and `^C` sends SIGINT. Stop waits for process exit before releasing the instance. A forced local kill waits for its exit notification.
+
 ## Validation
 
 Select one validation channel for a batch and reuse successful results for unchanged inputs. Standard commands:

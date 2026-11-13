@@ -91,7 +91,7 @@ impl<I: Instance + Debug> Supervisor<I> {
                 // Process control messages
                 msg = self.control_rx.recv() => {
                     let Some(msg) = msg else {
-                        if let Err(error) = self.handle_stop().await {
+                        if let Err(error) = self.handle_shutdown().await {
                             warn!("stop after owner release failed: {}", error);
                         }
                         break;
@@ -131,17 +131,18 @@ impl<I: Instance + Debug> Supervisor<I> {
                             let _ = tx.send(self.instance.lock().await.recent_output_with_offset(n));
                             Ok(())
                         }
-                        ControlMsg::Shutdown => self.handle_stop().await,
+                        ControlMsg::Shutdown => self.handle_shutdown().await,
                         ControlMsg::Acknowledged { .. } => Err(InstanceError::Config("nested acknowledgement".into())),
                     };
                     // Publish before acknowledging so callers observe the completed operation.
                     let _ = self.shared_state.send(self.instance.lock().await.state());
+                    let completed = result.is_ok();
                     if let Some(reply) = reply {
                         let _ = reply.send(result);
                     } else if let Err(error) = result {
                         warn!("instance control failed: {}", error);
                     }
-                    if shutdown { break; }
+                    if shutdown && completed { break; }
                 }
 
                 // Watch for process exit
@@ -234,6 +235,9 @@ impl<I: Instance + Debug> Supervisor<I> {
     async fn handle_stop(&self) -> Result<(), InstanceError> {
         let mut inst = self.instance.lock().await;
         if !inst.is_stoppable() {
+            if inst.process_handle().is_some() {
+                return Err(InstanceError::NotStoppable(inst.state()));
+            }
             debug!("instance not stoppable in state {:?}", inst.state());
             return Ok(());
         }
@@ -243,6 +247,9 @@ impl<I: Instance + Debug> Supervisor<I> {
     async fn handle_kill(&self) -> Result<(), InstanceError> {
         let mut inst = self.instance.lock().await;
         if !inst.is_stoppable() {
+            if inst.process_handle().is_some() {
+                return Err(InstanceError::NotStoppable(inst.state()));
+            }
             debug!("instance not killable in state {:?}", inst.state());
             return Ok(());
         }
@@ -260,6 +267,23 @@ impl<I: Instance + Debug> Supervisor<I> {
         self.handle_start(exit_watch).await
     }
 
+    async fn handle_shutdown(&self) -> Result<(), InstanceError> {
+        if let Err(error) = self.handle_stop().await {
+            warn!(%error, "graceful shutdown failed");
+        }
+        let mut instance = self.instance.lock().await;
+        if let Some(process) = instance.process_handle() {
+            if let Err(error) = process.kill(crate::core::process::Signal::Kill).await
+                && !matches!(error, crate::core::process::ProcessError::AlreadyExited)
+            {
+                return Err(error.into());
+            }
+            instance.clear_process(-1);
+        }
+        drop(instance);
+        Ok(())
+    }
+
     async fn handle_send_command(&self, cmd: &str) -> Result<(), InstanceError> {
         let inst = self.instance.lock().await;
         inst.send_command(cmd).await
@@ -268,7 +292,7 @@ impl<I: Instance + Debug> Supervisor<I> {
     /// Clean up after process exit: transition state to Stopped, clear process handle.
     async fn handle_process_exit(&self, exit_code: i32) -> Result<(), InstanceError> {
         let mut inst = self.instance.lock().await;
-        if inst.is_running() {
+        if inst.process_handle().is_some() {
             inst.clear_process(exit_code);
             drop(inst);
         }
@@ -286,6 +310,111 @@ mod tests {
     use crate::instance::path::InstancePath;
     use crate::instance::server::ServerConfig;
     use crate::process::local::LocalSpawner;
+
+    #[derive(Debug)]
+    struct ProcessControl {
+        alive: std::sync::atomic::AtomicBool,
+        failures: std::sync::atomic::AtomicUsize,
+        spawns: std::sync::atomic::AtomicUsize,
+        exit: watch::Sender<Option<i32>>,
+    }
+
+    #[derive(Debug)]
+    struct ControlledProcess(Arc<ProcessControl>);
+
+    #[async_trait::async_trait]
+    impl crate::core::process::ProcessHandle for ControlledProcess {
+        fn pid(&self) -> Option<u32> {
+            self.is_running().then_some(42)
+        }
+        async fn write(&self, _data: &[u8]) -> Result<(), crate::core::process::ProcessError> {
+            Ok(())
+        }
+        async fn kill(
+            &self,
+            _signal: crate::core::process::Signal,
+        ) -> Result<(), crate::core::process::ProcessError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self
+                .0
+                .failures
+                .try_update(SeqCst, SeqCst, |count| count.checked_sub(1))
+                .is_ok()
+            {
+                return Err(crate::core::process::ProcessError::KillFailed(
+                    "injected termination failure".into(),
+                ));
+            }
+            self.0.alive.store(false, SeqCst);
+            self.0.exit.send_replace(Some(0));
+            Ok(())
+        }
+        fn on_output(&self, _callback: crate::core::process::ProcessOutputCallback) {}
+        fn on_exit(&self, _callback: crate::core::process::ProcessExitCallback) {}
+        fn is_running(&self) -> bool {
+            self.0.alive.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn exit_watch(&self) -> Option<watch::Receiver<Option<i32>>> {
+            Some(self.0.exit.subscribe())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::core::process::ProcessSpawner for ControlledProcess {
+        async fn spawn(
+            &self,
+            _spec: &crate::core::process::ProcessSpec,
+        ) -> Result<Box<dyn crate::core::process::ProcessHandle>, crate::core::process::SpawnError>
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.0.spawns.fetch_add(1, SeqCst);
+            self.0.alive.store(true, SeqCst);
+            self.0.exit.send_replace(None);
+            Ok(Box::new(Self(Arc::clone(&self.0))))
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_errors_preserve_ownership_and_shutdown_retries_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let (exit, _) = watch::channel(None);
+        let control = Arc::new(ProcessControl {
+            alive: AtomicBool::new(false),
+            failures: AtomicUsize::new(1),
+            spawns: AtomicUsize::new(0),
+            exit,
+        });
+        let server = InstanceBuilder::new("controlled".into(), InstancePath::new("."))
+            .spawner(ControlledProcess(Arc::clone(&control)))
+            .event_bus(TokioBroadcastBus::new())
+            .build_server(ServerConfig {
+                start_command: "managed-service".into(),
+                stop_command: String::new(),
+                server_type: "universal".into(),
+                ..Default::default()
+            });
+        let service =
+            crate::service::instance::InstanceService::new(server, RestartPolicy::never());
+        service.start().await?;
+        assert!(service.stop().await.is_err());
+        assert!(matches!(service.state(), InstanceState::Error(_)));
+        assert!(control.alive.load(SeqCst));
+        assert!(service.start().await.is_err());
+        assert_eq!(control.spawns.load(SeqCst), 1);
+        service.stop().await?;
+        assert_eq!(service.state(), InstanceState::Stopped);
+        service.start().await?;
+        control.failures.store(3, SeqCst);
+        assert!(service.kill().await.is_err());
+        assert!(service.shutdown().await.is_err());
+        assert!(control.alive.load(SeqCst));
+        control.failures.store(1, SeqCst);
+        service.shutdown().await?;
+        assert!(!control.alive.load(SeqCst));
+        assert_eq!(service.state(), InstanceState::Stopped);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_supervisor_start_stop() {

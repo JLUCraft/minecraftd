@@ -94,6 +94,7 @@ pub trait StateMachine: Send + Sync {
             | (Stopped | Starting | Stopping | Error(_), Stopped)
             | (Starting, Running | Error(_))
             | (Running, Stopping | Error(_))
+            | (Error(_), Stopping)
             | (Stopping, Error(_))
             | (Busy, _) => true,
             (a, b) if a == b => true,
