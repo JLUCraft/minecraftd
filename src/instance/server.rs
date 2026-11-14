@@ -489,7 +489,7 @@ mod tests {
             core,
             ServerConfig {
                 server_type: "universal".into(),
-                start_command: "federated-server run --config host.json".into(),
+                start_command: "union-server run --config host.json".into(),
                 ..Default::default()
             },
         );

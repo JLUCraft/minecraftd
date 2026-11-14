@@ -4,7 +4,7 @@ A composable Rust library for Minecraft instance management, downloads, mod load
 
 ## Setup and structure
 
-Public APIs live under `src/`; integration tests live under `tests/`. Sibling `federated-server` and `FollyLauncher` consume this library through path dependencies.
+Public APIs live under `src/`; integration tests live under `tests/`. Sibling `union-server` and `FollyLauncher` consume this library through path dependencies.
 
 Download plans use `download::request::DownloadParam` for ordered source URLs, destination, integrity metadata, and optional file size. Loader preparation returns bound processor steps with its downloads so the host can persist and execute the installation plan. Resource source selection is defined in `resource::mirrors`. Forge and NeoForge server installation uses the shared native processor plan with server mappings and server-only steps. Download queues retain ownership of their tasks and abort pending transfers when dropped.
 
