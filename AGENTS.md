@@ -249,4 +249,4 @@
 
 ## Documentation ownership
 
-Keep project documentation in the root `AGENTS.md` and `README.md` only. Product content and required license files retain their existing locations. Workspace progress and evidence belong in `../TODO.md`; unresolved issues belong in `../PROBLEMS.md`. These workspace records are machine-local and are not published.
+Keep project documentation in the root `AGENTS.md` and `README.md` only. Product content and required license files retain their existing locations.
